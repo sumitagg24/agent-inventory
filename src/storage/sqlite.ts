@@ -320,7 +320,7 @@ export function getSnapshot(snapshotId: string): any | null {
 }
 
 export function getAllSnapshots(): any[] {
-  return db.prepare('SELECT id, created_at, name, description FROM snapshots ORDER BY created_at DESC').all();
+  return db.prepare('SELECT id, created_at, name, description, items_json, tools_json FROM snapshots ORDER BY created_at DESC').all();
 }
 
 export function deleteSnapshot(snapshotId: string): void {

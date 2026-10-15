@@ -9,25 +9,38 @@
   },
   "scripts": {
     "build": "tsc",
-    "dev": "ts-node --esm src/cli/index.ts",
+    "build:dashboard": "npm --prefix dashboard run build",
+    "dev": "node --loader ts-node/esm src/cli/index.ts",
     "start": "node dist/cli/index.js",
-    "test": "echo \"Error: no test specified\" && exit 1",
+    "test": "node --test dist/__tests__/units.js",
     "prepare": "npm run build"
   },
-  "keywords": ["mcp", "skills", "ai", "coding-agents", "inventory"],
+  "keywords": [
+    "mcp",
+    "skills",
+    "ai",
+    "coding-agents",
+    "inventory"
+  ],
   "author": "",
-  "license": "ISC",
+  "license": "MIT",
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.32.1",
     "better-sqlite3": "^13.0.3",
     "chalk": "^6.0.1",
     "commander": "^15.0.0",
+    "cors": "^2.8.6",
     "dotenv": "^18.0.8",
+    "express": "^5.3.0",
     "fast-glob": "^3.3.3",
-    "gray-matter": "^4.0.3"
+    "gray-matter": "^4.0.3",
+    "js-yaml": "^5.4.3"
   },
   "devDependencies": {
     "@types/better-sqlite3": "^9.6.0",
+    "@types/cors": "^2.8.19",
+    "@types/express": "^5.0.6",
+    "@types/js-yaml": "^4.0.9",
     "@types/node": "^26.6.5",
     "ts-node": "^10.9.2",
     "typescript": "^7.0.2"

@@ -17,9 +17,63 @@ import { scanWindsurf } from '../scanners/windsurf.js';
 import { scanClaudeDesktop } from '../scanners/claude-desktop.js';
 import { scanVSCode } from '../scanners/vscode.js';
 import { scanProjects } from '../scanners/project.js';
-import { upsertItem, getAllItems, getItemById, getToolsByItemId, recordScan, recordScanItem, getLatestScan, getDb } from '../storage/sqlite.js';
+import {
+  upsertItem,
+  getAllItems,
+  getAllTools,
+  getToolsByItemId,
+  recordScan,
+  recordScanItem,
+  finishScan,
+  getAllScans,
+  getDb,
+  createSnapshot,
+  getSnapshot,
+  getAllSnapshots,
+  getUsageSummary,
+  getAuditLog,
+  addAuditLog,
+  recordSecretFinding,
+  clearSecretFindings,
+} from '../storage/sqlite.js';
 import { inspectMcp } from '../introspection/mcp.js';
-import type { InstalledItem } from '../scanners/claude-code.js';
+import { runDoctor } from '../doctor/index.js';
+import { scanItemForSecrets } from '../secrets/scan.js';
+import { diffItemLists, formatDrift } from '../drift/index.js';
+import { parseTeamFile, checkAgainstProfile, sampleTeamFile, renderOnboardingDoc } from '../team/index.js';
+import { buildExportPayload, writeExportFile, buildAuditExport } from '../exporter/index.js';
+import { wrapMcpWithProxy, unwrapMcpProxy } from '../usage/proxy.js';
+import type { InstalledItem } from '../types.js';
+import crypto from 'crypto';
+import { fileURLToPath } from 'url';
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+
+function persistScan(scanId: string, items: InstalledItem[]): void {
+  for (const item of items) {
+    upsertItem(item);
+    recordScanItem(scanId, item.id);
+  }
+  recordScan(scanId, items.length);
+  finishScan(scanId);
+}
+
+function audit(action: string, details?: string, item?: any): void {
+  try {
+    addAuditLog({
+      id: crypto.randomUUID(),
+      action,
+      item_id: item?.id,
+      item_name: item?.name,
+      agent: item?.agent,
+      details,
+      user: process.env.USER || process.env.USERNAME,
+    });
+  } catch {
+    // audit must never break the command
+  }
+}
 
 const program = new Command();
 
@@ -71,12 +125,19 @@ program
       console.log(chalk.green(`  ✓ Found ${vscodeItems.length} items from VS Code`));
     }
 
-    // Store items in database
-    for (const item of items) {
-      upsertItem(item);
-    }
+    persistScan(scanId, items);
+    audit('scan', `agent=${agent} items=${items.length}`);
 
-    recordScan(scanId, items.length);
+    // Automatic secrets hygiene pass (metadata only, no values logged)
+    clearSecretFindings();
+    let secretCount = 0;
+    for (const item of items as InstalledItem[]) {
+      for (const f of scanItemForSecrets(item)) {
+        recordSecretFinding({ id: crypto.randomUUID(), item_id: f.itemId, pattern: f.pattern, location: f.location, severity: f.severity });
+        secretCount++;
+      }
+    }
+    if (secretCount > 0) console.log(chalk.yellow(`  ⚠️  ${secretCount} possible hardcoded credential(s) — see "agentinv doctor"`));
 
     console.log(chalk.green(`\n✅ Scan complete! Found ${items.length} total items.`));
     console.log(chalk.gray(`Run "agentinv list" to see all items.`));
@@ -96,12 +157,8 @@ program
       maxDepth: parseInt(options.maxDepth, 10),
     });
 
-    // Store items in database
-    for (const item of items) {
-      upsertItem(item);
-    }
-
-    recordScan(scanId, items.length);
+    persistScan(scanId, items as InstalledItem[]);
+    audit('scan-projects', `dir=${directory} items=${items.length}`);
 
     console.log(chalk.green(`\n✅ Project scan complete! Found ${items.length} total items.`));
     console.log(chalk.gray(`Run "agentinv list" to see all items.`));
@@ -162,6 +219,7 @@ program
   .command('inspect <name>')
   .description('Inspect an item in detail (runs introspection for MCPs)')
   .option('--no-cache', 'Force re-introspection, ignore cache')
+  .option('--yes', 'Skip opt-in confirmation for spawning the server')
   .action(async (name, options) => {
     // Try to find the item by name
     const items = getAllItems().filter(item =>
@@ -193,6 +251,12 @@ program
     }
 
     if (item.kind === 'mcp') {
+      const cached = getToolsByItemId(item.id);
+      if (!options.yes && cached.length === 0 && process.stdin.isTTY) {
+        console.log(chalk.yellow('\n⚠️  Introspection spawns this MCP server as a child process.'));
+        console.log(chalk.gray('Pass --yes to confirm. Continuing in 3s…'));
+        await new Promise((r) => setTimeout(r, 3000));
+      }
       console.log(chalk.blue('\n🔍 Running introspection...'));
       try {
         const tools = await inspectMcp(item, options.cache !== false);
@@ -227,15 +291,28 @@ program
 // ===== SEARCH COMMAND =====
 program
   .command('search <term>')
-  .description('Search items by name, description, or tool names')
+  .description('Search items by name, description, agent, or tool names')
   .action((term) => {
     const items = getAllItems();
+    const tools = getAllTools();
     const lowerTerm = term.toLowerCase();
 
-    const matches = items.filter(item =>
-      item.name.toLowerCase().includes(lowerTerm) ||
-      (item.description && item.description.toLowerCase().includes(lowerTerm)) ||
-      item.agent.toLowerCase().includes(lowerTerm)
+    const toolHitIds = new Set(
+      tools
+        .filter(
+          (t) =>
+            String(t.tool_name).toLowerCase().includes(lowerTerm) ||
+            (t.tool_description && String(t.tool_description).toLowerCase().includes(lowerTerm)),
+        )
+        .map((t) => t.item_id),
+    );
+
+    const matches = items.filter(
+      (item) =>
+        item.name.toLowerCase().includes(lowerTerm) ||
+        (item.description && item.description.toLowerCase().includes(lowerTerm)) ||
+        item.agent.toLowerCase().includes(lowerTerm) ||
+        toolHitIds.has(item.id),
     );
 
     if (matches.length === 0) {
@@ -248,7 +325,8 @@ program
     for (const item of matches) {
       const kindIcon = item.kind === 'mcp' ? '🔧' : '📝';
       const scopeBadge = item.scope === 'user' ? chalk.gray('[user]') : chalk.blue('[project]');
-      console.log(`  ${kindIcon} ${chalk.bold(item.name)} ${scopeBadge} ${chalk.cyan(`(${item.agent})`)}`);
+      const viaTool = toolHitIds.has(item.id) ? chalk.magenta(' [tool match]') : '';
+      console.log(`  ${kindIcon} ${chalk.bold(item.name)} ${scopeBadge} ${chalk.cyan(`(${item.agent})`)}${viaTool}`);
       if (item.description) {
         console.log(`     ${chalk.gray(item.description)}`);
       }
@@ -260,46 +338,32 @@ program
 // ===== DOCTOR COMMAND =====
 program
   .command('doctor')
-  .description('Check for broken configs and failed introspections')
-  .option('--fix', 'Attempt to fix issues (e.g., remove missing configs)')
+  .description('Check for broken configs, missing binaries, and hardcoded secrets')
+  .option('--fix', 'Remove DB rows whose config files are gone')
   .action((options) => {
     console.log(chalk.blue('\n🏥 Running health check...\n'));
 
     const items = getAllItems();
-    let issues = 0;
-    const toRemove: string[] = [];
+    const { healthy, issues } = runDoctor(items);
 
-    for (const item of items) {
-      // Check if config file exists
-      const configPath = item.config_path.startsWith('~')
-        ? item.config_path.replace('~', process.env.HOME || process.env.USERPROFILE || '')
-        : item.config_path;
-
-      if (!fs.existsSync(configPath)) {
-        console.log(chalk.red(`❌ ${item.name} (${item.agent}/${item.scope})`));
-        console.log(`   Config file missing: ${item.config_path}`);
-        issues++;
-        if (options.fix) {
-          toRemove.push(item.id);
-        }
-        continue;
-      }
-
-      // Check if launch command binary exists (for MCPs)
-      if (item.kind === 'mcp' && item.launch_command) {
-        const binary = item.launch_command.split(' ')[0];
-        // Check if binary is available on PATH
-        const isHttp = item.launch_command.startsWith('http');
-        if (!isHttp && !whichSync(binary)) {
-          console.log(chalk.yellow(`⚠️  ${item.name} (${item.agent}/${item.scope})`));
-          console.log(`   Binary not found on PATH: ${binary}`);
-          issues++;
-        }
+    const toRemove = new Set<string>();
+    for (const issue of issues) {
+      const icon = issue.severity === 'error' ? chalk.red('❌') : chalk.yellow('⚠️ ');
+      console.log(`${icon} ${issue.item} (${issue.agent}/${issue.scope})`);
+      console.log(`   [${issue.type}] ${issue.message}`);
+      if (options.fix && issue.type === 'missing_config') {
+        const hit = items.find((i) => i.name === issue.item && i.agent === issue.agent);
+        if (hit) toRemove.add(hit.id);
       }
     }
 
-    // Remove missing configs if --fix flag
-    if (options.fix && toRemove.length > 0) {
+    for (const item of items.filter((i) => i.kind === 'mcp')) {
+      if (getToolsByItemId(item.id).length === 0) {
+        console.log(chalk.gray(`ℹ️  ${item.name} (${item.agent}) — never introspected (run: agentinv inspect "${item.name}" --yes)`));
+      }
+    }
+
+    if (options.fix && toRemove.size > 0) {
       const db = getDb();
       const stmt = db.prepare('DELETE FROM items WHERE id = ?');
       for (const id of toRemove) {
@@ -308,53 +372,110 @@ program
       }
     }
 
-    if (issues === 0) {
-      console.log(chalk.green('✅ All configs look healthy!'));
-    } else {
-      console.log(chalk.red(`\n⚠️  Found ${issues} issue(s)`));
-      if (!options.fix) {
-        console.log(chalk.gray('Run with --fix to automatically remove missing configs.'));
-      }
+    if (healthy) console.log(chalk.green('✅ All configs look healthy!'));
+    else {
+      console.log(chalk.red(`\n⚠️  Found ${issues.length} issue(s)`));
+      if (!options.fix) console.log(chalk.gray('Run with --fix to remove rows for missing configs.'));
     }
   });
 
 // ===== EXPORT COMMAND =====
 program
   .command('export <file>')
-  .description('Export inventory to YAML/JSON')
+  .description('Export inventory to JSON/YAML (launch commands redacted)')
   .action((file) => {
     const items = getAllItems();
-    const data = {
-      exportedAt: new Date().toISOString(),
-      items: items.map(item => ({
-        id: item.id,
-        kind: item.kind,
-        name: item.name,
-        agent: item.agent,
-        scope: item.scope,
-        config_path: item.config_path,
-        launch_command: item.launch_command,
-        description: item.description,
-        last_seen: item.last_seen,
-        tools: getToolsByItemId(item.id)
-      }))
-    };
-
-    const ext = path.extname(file).toLowerCase();
-    const output = ext === '.yaml' || ext === '.yml'
-      ? require('js-yaml').dump(data)
-      : JSON.stringify(data, null, 2);
-
-    fs.writeFileSync(file, output);
+    const toolsByItem = new Map<string, any[]>();
+    for (const item of items) toolsByItem.set(item.id, getToolsByItemId(item.id));
+    const payload = buildExportPayload(items, toolsByItem);
+    writeExportFile(file, payload);
+    audit('export', `file=${file} items=${items.length}`);
     console.log(chalk.green(`✅ Exported ${items.length} items to ${file}`));
+  });
+
+// ===== SNAPSHOT COMMANDS =====
+program
+  .command('snapshot <name>')
+  .description('Save a named snapshot of the current inventory')
+  .option('-d, --description <text>', 'Snapshot description')
+  .action((name, options) => {
+    const items = getAllItems();
+    const tools = getAllTools();
+    const id = `snap_${Date.now()}`;
+    createSnapshot({ id, name, description: options.description, items_json: JSON.stringify(items), tools_json: JSON.stringify(tools) });
+    audit('snapshot', `id=${id} name=${name} items=${items.length}`);
+    console.log(chalk.green(`✅ Snapshot "${name}" saved (${items.length} items, id=${id})`));
+  });
+
+program
+  .command('snapshots')
+  .description('List saved snapshots')
+  .action(() => {
+    const snaps = getAllSnapshots();
+    if (snaps.length === 0) {
+      console.log(chalk.yellow('No snapshots yet. Run "agentinv snapshot <name>" first.'));
+      return;
+    }
+    for (const s of snaps) console.log(`  ${chalk.bold(s.name ?? s.id)}  ${chalk.gray(s.id)}  ${s.created_at}`);
+  });
+
+program
+  .command('drift [snapshotId]')
+  .description('Diff current inventory against a snapshot (or two scans with --scans)')
+  .option('--scans <ids>', 'Compare two scan ids: --scans <id1,id2>')
+  .action((snapshotId, options) => {
+    if (typeof snapshotId === 'object' && snapshotId !== null && !options?.scans) {
+      options = snapshotId;
+      snapshotId = undefined;
+    }
+    if (options?.scans) {
+      const [id1, id2] = String(options.scans).split(',');
+      const db = getDb();
+      const before = db.prepare('SELECT * FROM items WHERE id IN (SELECT item_id FROM scan_items WHERE scan_id = ?)').all(id1);
+      const afterScan = db.prepare('SELECT * FROM items WHERE id IN (SELECT item_id FROM scan_items WHERE scan_id = ?)').all(id2);
+      console.log(chalk.bold(`\n📊 Drift: ${id1} → ${id2}\n`));
+      console.log(formatDrift(diffItemLists(before as any[], afterScan as any[])));
+      return;
+    }
+    const snap = (snapshotId ? getSnapshot(snapshotId) : undefined) ?? getAllSnapshots().find((s) => s.name === snapshotId || s.id === snapshotId);
+    if (!snap) {
+      console.log(chalk.red(`Snapshot "${snapshotId ?? '(none)'}" not found. Run "agentinv snapshots" to list them.`));
+      return;
+    }
+    let before: any[];
+    try {
+      before = JSON.parse(snap.items_json);
+    } catch {
+      console.log(chalk.red(`Snapshot "${snap.name ?? snap.id}" has corrupt data.`));
+      return;
+    }
+    console.log(chalk.bold(`\n📊 Drift vs snapshot "${snap.name ?? snap.id}":\n`));
+    console.log(formatDrift(diffItemLists(before, getAllItems())));
+  });
+
+program
+  .command('scans')
+  .description('List recorded scans')
+  .action(() => {
+    const scans = getAllScans();
+    if (scans.length === 0) {
+      console.log(chalk.yellow('No scans recorded yet.'));
+      return;
+    }
+    for (const s of scans) console.log(`  ${chalk.bold(s.id)}  ${s.started_at}  items=${s.items_found ?? '?'}`);
   });
 
 // ===== INTROSPECT-ALL COMMAND =====
 program
   .command('introspect-all')
   .description('Run introspection on all MCP servers (opt-in, uses cache)')
-  .action(async () => {
+  .option('--yes', 'Skip confirmation')
+  .action(async (options) => {
     console.log(chalk.blue('\n🔍 Introspecting all MCP servers...\n'));
+    if (!options.yes && process.stdin.isTTY) {
+      console.log(chalk.yellow('⚠️  This spawns each configured MCP server. Pass --yes to confirm. Continuing in 3s…'));
+      await new Promise((r) => setTimeout(r, 3000));
+    }
 
     const items = getAllItems().filter(item => item.kind === 'mcp');
     let success = 0;
@@ -375,30 +496,168 @@ program
     console.log(chalk.green(`\n✅ Completed: ${success} succeeded, ${failed} failed`));
   });
 
+// ===== USAGE COMMANDS =====
+program
+  .command('usage')
+  .description('Show dormant vs active MCPs/skills')
+  .option('--days <n>', 'Window in days', '30')
+  .action((options) => {
+    const days = parseInt(options.days, 10) || 30;
+    const summary = getUsageSummary(days);
+    const active = summary.filter((s) => Number(s.event_count) > 0);
+    const totalEvents = summary.reduce((a: number, s: any) => a + Number(s.event_count || 0), 0);
+    console.log(chalk.bold(`\n📊 Usage — last ${days} days`));
+    console.log(chalk.gray(`Active: ${active.length}/${summary.length} items, ${totalEvents} events\n`));
+    const sorted = [...summary].sort((a, b) => Number(b.event_count) - Number(a.event_count));
+    for (const s of sorted.slice(0, 20)) {
+      const mark = Number(s.event_count) > 0 ? chalk.green('●') : chalk.gray('○');
+      console.log(`  ${mark} ${s.name} ${chalk.gray(`(${s.agent}/${s.kind})`)} — ${s.event_count} calls${s.last_used ? chalk.gray(` last ${s.last_used}`) : ''}`);
+    }
+  });
+
+program
+  .command('wrap <name>')
+  .description('Install usage-tracking proxy shim for an MCP (opt-in, reversible)')
+  .action((name) => {
+    const items = getAllItems().filter((i) => i.name.toLowerCase() === name.toLowerCase() && i.kind === 'mcp');
+    if (items.length === 0) {
+      console.log(chalk.red(`MCP "${name}" not found.`));
+      return;
+    }
+    const item = items[0];
+    const shimPath = path.join(__dirname, '..', 'usage', 'shim.js');
+    try {
+      const res = wrapMcpWithProxy(item, shimPath);
+      audit('wrap', `shim=${shimPath}`, item);
+      console.log(chalk.green(`✅ Wrapped "${item.name}" — calls now logged to usage_events.`));
+      console.log(chalk.gray(`Config: ${res.configFile}${res.backedUp ? ' (original backed up)' : ''}`));
+      console.log(chalk.gray('Restore with: agentinv unwrap "' + item.name + '"'));
+    } catch (err) {
+      console.log(chalk.red(`Wrap failed: ${(err as Error).message}`));
+    }
+  });
+
+program
+  .command('unwrap <name>')
+  .description('Remove usage-tracking shim and restore original config')
+  .action(async (name) => {
+    const items = getAllItems().filter((i) => i.name.toLowerCase() === name.toLowerCase() && i.kind === 'mcp');
+    if (items.length === 0) {
+      console.log(chalk.red(`MCP "${name}" not found.`));
+      return;
+    }
+    const mod = await import('../usage/proxy.js');
+    const res = mod.unwrapMcpProxy(items[0]);
+    audit('unwrap', undefined, items[0]);
+    if (res.restored) console.log(chalk.green(`✅ Restored original config for "${items[0].name}".`));
+    else console.log(chalk.yellow('No backup found — config left untouched.'));
+  });
+
+// ===== TEAM COMMANDS =====
+program
+  .command('team-init')
+  .description('Write a sample team.yaml in the current directory')
+  .action(() => {
+    const out = path.join(process.cwd(), 'team.yaml');
+    if (fs.existsSync(out)) {
+      console.log(chalk.yellow('team.yaml already exists.'));
+      return;
+    }
+    fs.writeFileSync(out, sampleTeamFile());
+    console.log(chalk.green(`✅ Wrote ${out}`));
+  });
+
+program
+  .command('team-check [file]')
+  .description('Compare inventory against team.yaml (default: ./team.yaml)')
+  .action((file) => {
+    const teamFile = file ?? path.join(process.cwd(), 'team.yaml');
+    if (!fs.existsSync(teamFile)) {
+      console.log(chalk.red(`Team file not found: ${teamFile}. Run "agentinv team-init" first.`));
+      process.exitCode = 1;
+      return;
+    }
+    const profile = parseTeamFile(teamFile);
+    const result = checkAgainstProfile(getAllItems(), profile);
+    console.log(chalk.bold(`\n👥 Team check: ${profile.team ?? teamFile}`));
+    console.log(chalk.green(`  Matched: ${result.matched.length}`));
+    for (const m of result.matched) console.log(`    ✓ ${m.requirement.name} (${m.requirement.kind})`);
+    if (result.missing.length > 0) {
+      console.log(chalk.red(`  Missing: ${result.missing.length}`));
+      for (const m of result.missing) console.log(`    ✗ ${m.name} (${m.kind}${m.agent ? '/' + m.agent : ''})`);
+    }
+    if (result.blockedFound.length > 0) {
+      console.log(chalk.red(`  Blocked found: ${result.blockedFound.length}`));
+      for (const b of result.blockedFound) console.log(`    ⛔ ${b.requirement.name} in use by ${b.item.agent}`);
+    }
+    audit('team-check', `missing=${result.missing.length} blocked=${result.blockedFound.length}`);
+    if (result.missing.length > 0 || result.blockedFound.length > 0) process.exitCode = 1;
+    else console.log(chalk.green('\n✅ Environment matches team profile.'));
+  });
+
+program
+  .command('onboard [file]')
+  .description('Generate onboarding markdown from team.yaml')
+  .option('-o, --out <file>', 'Output file', 'ONBOARDING.md')
+  .action((file, options) => {
+    const teamFile = file ?? path.join(process.cwd(), 'team.yaml');
+    if (!fs.existsSync(teamFile)) {
+      console.log(chalk.red(`Team file not found: ${teamFile}`));
+      return;
+    }
+    const profile = parseTeamFile(teamFile);
+    const doc = renderOnboardingDoc(profile, getAllItems());
+    fs.writeFileSync(options.out, doc);
+    console.log(chalk.green(`✅ Wrote ${options.out}`));
+  });
+
+program
+  .command('export-audit <file>')
+  .description('Export audit log as CSV or JSON (by extension)')
+  .option('--limit <n>', 'Max rows', '500')
+  .action((file, options) => {
+    const log = getAuditLog(parseInt(options.limit, 10) || 500);
+    const ext = path.extname(file).toLowerCase();
+    const out = ext === '.json' ? buildAuditExport(log, 'json') : buildAuditExport(log, 'csv');
+    fs.mkdirSync(path.dirname(path.resolve(file)), { recursive: true });
+    fs.writeFileSync(file, out);
+    console.log(chalk.green(`✅ Exported ${log.length} audit rows to ${file}`));
+  });
+
+program
+  .command('stats')
+  .description('Show inventory summary statistics')
+  .action(() => {
+    const items = getAllItems();
+    const tools = getAllTools();
+    const byAgent = new Map<string, number>();
+    const byKind = new Map<string, number>();
+    for (const i of items) {
+      byAgent.set(i.agent, (byAgent.get(i.agent) ?? 0) + 1);
+      byKind.set(i.kind, (byKind.get(i.kind) ?? 0) + 1);
+    }
+    console.log(chalk.bold('\n📊 Inventory stats\n'));
+    console.log(`  Items: ${items.length}  Tools introspected: ${tools.length}`);
+    for (const [k, v] of byKind) console.log(`  ${k}: ${v}`);
+    for (const [a, v] of byAgent) console.log(`  ${a}: ${v}`);
+    const usage = getUsageSummary(30);
+    const active = usage.filter((u: any) => Number(u.event_count) > 0).length;
+    console.log(chalk.gray(`\n  Active in last 30d: ${active}/${usage.length}`));
+  });
+
 // ===== SERVE COMMAND =====
 program
   .command('serve')
-  .description('Launch local dashboard (not yet implemented)')
+  .description('Launch local dashboard (API + built UI)')
   .option('-p, --port <port>', 'Port to serve on', '3000')
-  .action((options) => {
-    console.log(chalk.yellow('Dashboard not yet implemented. Use CLI commands for now.'));
-    console.log(chalk.gray(`Would serve on http://localhost:${options.port}`));
+  .action(async (options) => {
+    const port = parseInt(options.port, 10) || 3000;
+    const { createServer } = await import('../server/index.js');
+    const server = createServer({ port });
+    server.listen(port, () => {
+      console.log(chalk.green(`✅ Dashboard at http://localhost:${port}`));
+      console.log(chalk.gray('API: /api/items /api/tools /api/search?q= /api/stats /api/doctor /api/export'));
+    });
   });
-
-// Helper function to check if binary exists on PATH
-function whichSync(cmd: string): boolean {
-  const paths = (process.env.PATH || '').split(path.delimiter);
-  const exts = process.platform === 'win32' ? ['.exe', '.cmd', '.bat', ''] : [''];
-
-  for (const p of paths) {
-    for (const ext of exts) {
-      const fullPath = path.join(p, cmd + ext);
-      if (fs.existsSync(fullPath)) {
-        return true;
-      }
-    }
-  }
-  return false;
-}
 
 program.parse();

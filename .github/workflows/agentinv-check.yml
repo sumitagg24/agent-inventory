@@ -1,0 +1,19 @@
+name: agentinv team check
+
+on:
+  pull_request:
+  push:
+    branches: [main, master]
+
+jobs:
+  team-check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - run: npm install -g agent-inventory
+      # Validates the repo's checked-in agent configs against team.yaml:
+      # fails the PR if a required MCP/skill was removed from the repo.
+      - run: agentinv team-check team.yaml
