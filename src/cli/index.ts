@@ -16,6 +16,7 @@ import { scanCursor } from '../scanners/cursor.js';
 import { scanWindsurf } from '../scanners/windsurf.js';
 import { scanClaudeDesktop } from '../scanners/claude-desktop.js';
 import { scanVSCode } from '../scanners/vscode.js';
+import { scanCodex } from '../scanners/codex.js';
 import { scanProjects } from '../scanners/project.js';
 import {
   upsertItem,
@@ -37,7 +38,16 @@ import {
   recordSecretFinding,
   clearSecretFindings,
 } from '../storage/sqlite.js';
+import { enrichLicenses } from '../license/index.js';
 import { inspectMcp } from '../introspection/mcp.js';
+import {
+  setIntrospectionResult,
+} from '../storage/sqlite.js';
+import {
+  takeSnapshot,
+  manifestFromSnapshot,
+  restoreSnapshotFiles,
+} from '../snapshots/index.js';
 import { runDoctor } from '../doctor/index.js';
 import { scanItemForSecrets } from '../secrets/scan.js';
 import { diffItemLists, formatDrift } from '../drift/index.js';
@@ -87,7 +97,7 @@ program
 program
   .command('scan')
   .description('Scan all known agents for MCP servers and Skills')
-  .option('-a, --agent <agent>', 'Scan specific agent (claude-code, cursor, windsurf, claude-desktop, vscode, all)')
+  .option('-a, --agent <agent>', 'Scan specific agent (claude-code, cursor, windsurf, claude-desktop, vscode, codex, all)')
   .action(async (options) => {
     console.log(chalk.blue('🔍 Scanning for MCP servers and Skills...'));
     const scanId = `scan_${Date.now()}`;
@@ -124,6 +134,12 @@ program
       const vscodeItems = scanVSCode();
       items = items.concat(vscodeItems);
       console.log(chalk.green(`  ✓ Found ${vscodeItems.length} items from VS Code`));
+    }
+
+    if (agent === 'all' || agent === 'codex') {
+      const codexItems = scanCodex();
+      items = items.concat(codexItems);
+      console.log(chalk.green(`  ✓ Found ${codexItems.length} items from Codex/others`));
     }
 
     persistScan(scanId, items);
@@ -261,6 +277,7 @@ program
       console.log(chalk.blue('\n🔍 Running introspection...'));
       try {
         const tools = await inspectMcp(item, options.cache !== false);
+        setIntrospectionResult(item.id, true);
         if (tools && tools.length > 0) {
           console.log(chalk.green(`\n  Found ${tools.length} tools:`));
           for (const tool of tools) {
@@ -274,7 +291,9 @@ program
           console.log(chalk.yellow('\n  No tools returned (or introspection failed)'));
         }
       } catch (err) {
-        console.log(chalk.red(`\n  Introspection failed: ${err}`));
+        const msg = err instanceof Error ? err.message : String(err);
+        setIntrospectionResult(item.id, false, msg);
+        console.log(chalk.red(`\n  Introspection failed: ${msg}`));
       }
     }
 
@@ -334,6 +353,27 @@ program
     }
 
     console.log(chalk.gray(`\n${matches.length} match(es) found`));
+  });
+
+program
+  .command('licenses')
+  .description('Show license & provenance for MCP packages (plan §8.15; network lookup, cached)')
+  .option('--refresh', 'Re-query registries even when cached')
+  .option('--json', 'Output as JSON')
+  .action(async (options) => {
+    const results = await enrichLicenses({ refresh: options.refresh });
+    audit('licenses', `items=${results.length} refresh=${options.refresh ? 'yes' : 'no'}`);
+    if (options.json) {
+      console.log(JSON.stringify(results, null, 2));
+      return;
+    }
+    console.log(chalk.bold(`\n🔐 License & provenance (${results.length} MCP servers):`));
+    for (const r of results) {
+      const lic = r.license === 'unknown' ? chalk.red('unknown') : chalk.green(r.license);
+      console.log(`  ${r.name} ${lic}${r.source ? chalk.gray(`  (${r.source})`) : chalk.gray('  (no public source)')}`);
+    }
+    const unknown = results.filter((r) => r.license === 'unknown').length;
+    if (unknown > 0) console.log(chalk.yellow(`\n⚠️  ${unknown} item(s) unresolved — run with --refresh later or review manually.`));
   });
 
 // ===== DOCTOR COMMAND =====
@@ -397,15 +437,16 @@ program
 // ===== SNAPSHOT COMMANDS =====
 program
   .command('snapshot <name>')
-  .description('Save a named snapshot of the current inventory')
+  .description('Save a named bundle: inventory + config/SKILL.md file contents (secrets redacted)')
   .option('-d, --description <text>', 'Snapshot description')
   .action((name, options) => {
-    const items = getAllItems();
-    const tools = getAllTools();
-    const id = `snap_${Date.now()}`;
-    createSnapshot({ id, name, description: options.description, items_json: JSON.stringify(items), tools_json: JSON.stringify(tools) });
-    audit('snapshot', `id=${id} name=${name} items=${items.length}`);
-    console.log(chalk.green(`✅ Snapshot "${name}" saved (${items.length} items, id=${id})`));
+    const manifest = takeSnapshot(name, options.description);
+    const bundled = manifest.files.filter((f) => f.included).length;
+    audit('snapshot', `id=${manifest.id} name=${name} items=${manifest.items.length} files=${bundled}`);
+    console.log(chalk.green(`✅ Snapshot "${name}" saved (${manifest.items.length} items, ${bundled} file(s) bundled, id=${manifest.id})`));
+    if (manifest.secretsRedacted.length > 0) {
+      console.log(chalk.yellow(`   ⚠️  ${manifest.secretsRedacted.length} file(s) had secrets redacted — re-add API keys after restore.`));
+    }
   });
 
 program
@@ -490,25 +531,38 @@ program
       console.log(chalk.red(`Snapshot "${snapshotId}" not found. Run "agentinv snapshots" to list them.`));
       return;
     }
-    let items: any[];
+    let manifest;
     try {
-      items = JSON.parse(snap.items_json);
+      manifest = manifestFromSnapshot(snap);
     } catch {
-      console.log(chalk.red(`Snapshot "${snap.name ?? snap.id}" has corrupt data.`));
+      console.log(chalk.red('Snapshot has corrupt data.'));
       return;
     }
-    console.log(chalk.bold(`\n📦 Restore plan: snapshot "${snap.name ?? snap.id}" (${items.length} items)`));
+    const items = manifest.items;
+    const bundledCount = manifest.files.filter((f) => f.included).length;
+    console.log(chalk.bold(`
+📦 Restore plan: snapshot "${snap.name ?? snap.id}" (${items.length} items, ${bundledCount} file(s) bundled)`));
     const { createInterface } = await import('readline');
     for (const item of items) {
       const tag = item.kind === 'mcp' ? '🔧' : '📝';
-      console.log(`  ${tag} ${item.name} [${item.agent}/${item.scope}] → ${item.config_path}`);
+      const f = manifest.files.find((x) => x.itemId === item.id);
+      const state = f && f.included ? chalk.green('bundled') : chalk.gray((f && f.note) || 'not bundled');
+      console.log(`  ${tag} ${item.name} [${item.agent}/${item.scope}] → ${item.config_path} ${state}`);
+    }
+    if (manifest.secretsRedacted.length > 0) {
+      console.log(chalk.yellow(`
+⚠️  ${manifest.secretsRedacted.length} file(s) contain redacted secrets — re-add API keys after restore.`));
     }
     if (!options.apply) {
       console.log(chalk.yellow('\nDry-run only — no files written. Re-run with --apply to restore.'));
-      console.log(chalk.gray('Secrets are redacted in snapshots; you must re-add API keys after restore.'));
       return;
     }
-    console.log(chalk.yellow('\n⚠️  --apply will overwrite config files listed above.'));
+    if (bundledCount === 0) {
+      console.log(chalk.red('\nNo files bundled in this snapshot (it predates file capture). Re-run "agentinv snapshot" first.'));
+      return;
+    }
+    console.log(chalk.yellow(`
+⚠️  --apply will overwrite ${bundledCount} file(s) listed above.`));
     if (process.stdin.isTTY && !options.yes) {
       const rl = createInterface({ input: process.stdin, output: process.stdout });
       const answer = await new Promise<string>((resolve) =>
@@ -522,25 +576,13 @@ program
         return;
       }
     }
-    // v1 restore scope: recreate skill dirs + merge MCP JSON entries.
-    // Full-file overwrite is intentionally NOT automatic (configs may have
-    // changed since the snapshot); each write below is additive and logged.
-    let wrote = 0;
-    for (const item of items) {
-      try {
-        if (item.kind === 'skill') {
-          console.log(chalk.gray(`  skip (skill reference only): ${item.config_path}`));
-        } else {
-          console.log(chalk.gray(`  planned (mcp entry): ${item.name} → ${item.config_path}`));
-        }
-        wrote++;
-      } catch (err) {
-        console.log(chalk.red(`  failed ${item.name}: ${(err as Error).message}`));
-      }
-    }
-    audit('restore', `snapshot=${snap.id} planned=${wrote} mode=${options.apply ? 'apply-preview' : 'dry-run'}`);
-    console.log(chalk.yellow(`\nRestore in v1 is plan-only (${wrote} items planned, 0 files overwritten).`));
-    console.log(chalk.gray('Use "agentinv export" + your agent docs to recreate configs; secrets must be re-added manually.'));
+    const writeResult = restoreSnapshotFiles(manifest);
+    for (const w of writeResult.written) console.log(chalk.gray(`  written: ${w}`));
+    for (const s of writeResult.skipped) console.log(chalk.gray(`  skipped: ${s.path} (${s.reason})`));
+    audit('restore', `snapshot=${snap.id} written=${writeResult.written.length} skipped=${writeResult.skipped.length} mode=apply`);
+    console.log(chalk.green(`
+✅ Restored ${writeResult.written.length} file(s), skipped ${writeResult.skipped.length}.`));
+    console.log(chalk.gray('Secrets were redacted in the snapshot — re-add API keys, then run "agentinv scan".'));
   });
 
 // ===== INTROSPECT-ALL COMMAND =====
@@ -563,10 +605,13 @@ program
       console.log(`\nIntrospecting ${item.name}...`);
       try {
         const tools = await inspectMcp(item);
+        setIntrospectionResult(item.id, true);
         console.log(`  ✅ Found ${tools.length} tool(s)`);
         success++;
       } catch (err) {
-        console.log(`  ❌ Failed: ${(err as Error).message}`);
+        const msg = err instanceof Error ? err.message : String(err);
+        setIntrospectionResult(item.id, false, msg);
+        console.log(`  ❌ Failed: ${msg}`);
         failed++;
       }
     }

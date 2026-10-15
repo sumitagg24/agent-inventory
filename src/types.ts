@@ -13,6 +13,14 @@ export interface InstalledItem {
   launch_command?: string;
   description?: string;
   last_seen: string;
+  /** JSON-encoded allowed-tools / declared capabilities (plan §3.2). */
+  capabilities?: string;
+  /** Introspection outcome for doctor (plan §3.2/§8.4). */
+  introspection_status?: 'never' | 'ok' | 'failed';
+  introspection_error?: string;
+  introspected_at?: string;
+  license?: string;
+  source?: string;
 }
 
 export interface DiscoveredToolRecord {
@@ -38,6 +46,9 @@ export const SUPPORTED_AGENTS = [
   'windsurf',
   'claude-desktop',
   'vscode',
+  'codex',
+  'kiro',
+  'generic',
 ] as const;
 
 export type SupportedAgent = (typeof SUPPORTED_AGENTS)[number];

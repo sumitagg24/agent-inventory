@@ -85,10 +85,25 @@ export function runDoctor(items: any[]): { healthy: boolean; issues: DoctorIssue
           type: 'missing_binary', message: `Binary not found on PATH: ${binary}`, severity: 'warning',
         });
       }
-      // No cached tools after a scan = introspection never succeeded.
-      if (!itemHasTools(item)) {
-        // soft signal only when we can check; CLI joins tools table separately.
+      // Plan §8.4.1: did the last introspection attempt fail?
+      if (item.introspection_status === 'failed') {
+        issues.push({
+          item: item.name, agent: item.agent, scope: item.scope,
+          type: 'introspection_failed',
+          message: `Last introspection failed: ${item.introspection_error ?? 'unknown error'} (re-run: agentinv inspect "${item.name}" --yes)`,
+          severity: 'warning',
+        });
       }
+    }
+
+    // Plan §8.15: surface provenance once enrichment has run.
+    if (item.license === 'unknown') {
+      issues.push({
+        item: item.name, agent: item.agent, scope: item.scope,
+        type: 'provenance_unknown',
+        message: 'No public source found for license review (run: agentinv licenses)',
+        severity: 'warning',
+      });
     }
 
     // Secrets hygiene (never includes secret values)

@@ -96,3 +96,33 @@ export function redactLaunchCommand(cmd?: string): string | undefined {
   out = out.replace(/(api[_-]?key|token|secret|password)=[^ \s]+/gi, '$1=**REDACTED**');
   return out;
 }
+
+/**
+ * Redact secrets anywhere in a text blob (plan §8.7.3: never bundle secrets —
+ * used when snapshot/export captures raw config + SKILL.md file contents).
+ * Returns [redactedText, didRedact].
+ */
+export function redactSecretsInText(text: string): [string, boolean] {
+  let out = text;
+  let did = false;
+  const replace = (re: RegExp, repl: string | ((...args: any[]) => string)): void => {
+    if (re.test(out)) {
+      out = out.replace(re, repl as string);
+      did = true;
+    }
+    re.lastIndex = 0;
+  };
+  replace(/sk-(proj-)?[A-Za-z0-9_-]{20,}/g, 'sk-**REDACTED**');
+  replace(/gh[pousr]_[A-Za-z0-9_]{20,}/g, 'gh**REDACTED**');
+  replace(/AIza[0-9A-Za-z_-]{20,}/g, 'AIza**REDACTED**');
+  replace(/AKIA[0-9A-Z]{16}/g, 'AKIA**REDACTED**');
+  replace(/xox[baprs]-[A-Za-z0-9-]+/g, 'xox**REDACTED**');
+  replace(/-----BEGIN (RSA |EC |OPENSSH )?PRIVATE KEY-----[\s\S]*?-----END (RSA |EC |OPENSSH )?PRIVATE KEY-----/g, '**REDACTED PRIVATE KEY**');
+  // JSON shape: keep quotes so the file stays parseable after redaction.
+  replace(/("(?:api[_-]?key|apikey|token|secret|password|authorization|access[_-]?key)"\s*:\s*)"[^"]*"/gi, '$1"**REDACTED**"');
+  // KEY=value shape (env blocks, CLI args).
+  replace(/\b(api[_-]?key|token|secret|password|authorization)(\s*[:=]\s*)[^\s"',;]{8,}/gi, '$1$2**REDACTED**');
+  replace(/https?:\/\/[^\s/:@]+:[^\s@]+@[^\s]+/g, (m: string) => m.replace(/:[^:@/]+@/, ':**REDACTED**@'));
+  replace(/Bearer\s+[A-Za-z0-9\-._~+/=]{20,}/gi, 'Bearer **REDACTED**');
+  return [out, did];
+}

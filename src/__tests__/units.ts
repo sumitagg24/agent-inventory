@@ -5,7 +5,8 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import { diffItemLists } from '../drift/index.js';
-import { redactLaunchCommand, scanItemForSecrets } from '../secrets/scan.js';
+import { redactLaunchCommand, redactSecretsInText, scanItemForSecrets } from '../secrets/scan.js';
+import { inferNpmPackage, inferPyPackage } from '../license/index.js';
 import { checkAgainstProfile, parseTeamFile, renderOnboardingDoc, sampleTeamFile } from '../team/index.js';
 import { buildAuditExport, buildExportPayload } from '../exporter/index.js';
 import fs from 'fs';
@@ -43,6 +44,32 @@ describe('secrets', () => {
     });
     assert.ok(findings.some((f) => f.pattern === 'github_token'));
     assert.ok(!JSON.stringify(findings).includes('ghp_abcdef'));
+  });
+  it('redacts secrets in config text while keeping JSON valid (bundle capture)', () => {
+    const raw = JSON.stringify({ mcpServers: { a: { env: { API_KEY: 'sk-proj-abcdefghijklmnop123456' } } } }, null, 2);
+    const [out, didRedact] = redactSecretsInText(raw);
+    assert.equal(didRedact, true);
+    assert.ok(!out.includes('abcdefghijklmnop'));
+    assert.doesNotThrow(() => JSON.parse(out));
+  });
+  it('leaves clean text untouched', () => {
+    const [out, didRedact] = redactSecretsInText('name: my-skill\nallowed-tools: Read, Bash');
+    assert.equal(didRedact, false);
+    assert.equal(out, 'name: my-skill\nallowed-tools: Read, Bash');
+  });
+});
+
+describe('license', () => {
+  it('infers npm packages from npx and node_modules paths', () => {
+    assert.equal(inferNpmPackage('npx -y @modelcontextprotocol/server-filesystem /tmp'), '@modelcontextprotocol/server-filesystem');
+    assert.equal(inferNpmPackage('node /home/u/node_modules/mcp-remote/dist/index.js https://x'), 'mcp-remote');
+    assert.equal(inferNpmPackage('npx -y mcp-remote https://x --header auth:$API_KEY'), 'mcp-remote');
+    assert.equal(inferNpmPackage('/usr/bin/claude'), null);
+    assert.equal(inferNpmPackage(undefined), null);
+  });
+  it('infers PyPI packages from pip install commands', () => {
+    assert.equal(inferPyPackage('python -m pip install mcp-server-git'), 'mcp-server-git');
+    assert.equal(inferPyPackage('npx -y something'), null);
   });
 });
 

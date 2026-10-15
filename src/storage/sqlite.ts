@@ -104,6 +104,31 @@ db.exec(`
   );
 `);
 
+// Safe additive migrations for DBs created by older versions.
+function migrate(): void {
+  const cols = new Set(
+    (db.prepare(`PRAGMA table_info(items)`).all() as any[]).map((c) => c.name),
+  );
+  const add = (name: string, ddl: string): void => {
+    if (!cols.has(name)) {
+      db.exec(`ALTER TABLE items ADD COLUMN ${ddl}`);
+      cols.add(name);
+    }
+  };
+  add('launch_command_raw', 'launch_command_raw TEXT');
+  add('introspection_status', `introspection_status TEXT DEFAULT 'never'`);
+  add('introspection_error', 'introspection_error TEXT');
+  add('introspected_at', 'introspected_at TEXT');
+  add('capabilities', 'capabilities TEXT');
+  add('license', 'license TEXT');
+  add('source', 'source TEXT');
+  const snapCols = new Set(
+    (db.prepare(`PRAGMA table_info(snapshots)`).all() as any[]).map((c) => c.name),
+  );
+  if (!snapCols.has('files_json')) db.exec(`ALTER TABLE snapshots ADD COLUMN files_json TEXT`);
+}
+migrate();
+
 /**
  * Get the database instance.
  */
@@ -120,12 +145,23 @@ export function upsertItem(item: {
   scope: string;
   config_path: string;
   launch_command?: string;
+  launch_command_raw?: string;
   description?: string;
   last_seen: string;
+  introspection_status?: string;
+  introspection_error?: string;
+  introspected_at?: string;
+  capabilities?: string;
+  license?: string;
+  source?: string;
 }): void {
+  // Security §5: never persist raw launch commands that embed secrets —
+  // store a redacted display copy, keep the raw only behind an explicit opt-in.
+  // (Raw capture is deferred to a future --include-secrets export flag; for now
+  // launch_command is always the redacted form.)
   const stmt = db.prepare(`
-    INSERT INTO items (id, kind, name, agent, scope, config_path, launch_command, description, last_seen)
-    VALUES (@id, @kind, @name, @agent, @scope, @config_path, @launch_command, @description, @last_seen)
+    INSERT INTO items (id, kind, name, agent, scope, config_path, launch_command, launch_command_raw, description, last_seen, introspection_status, introspection_error, introspected_at, capabilities, license, source)
+    VALUES (@id, @kind, @name, @agent, @scope, @config_path, @launch_command, @launch_command_raw, @description, @last_seen, COALESCE(@introspection_status, 'never'), @introspection_error, @introspected_at, @capabilities, @license, @source)
     ON CONFLICT(id) DO UPDATE SET
       kind = excluded.kind,
       name = excluded.name,
@@ -133,8 +169,12 @@ export function upsertItem(item: {
       scope = excluded.scope,
       config_path = excluded.config_path,
       launch_command = excluded.launch_command,
+      launch_command_raw = COALESCE(excluded.launch_command_raw, items.launch_command_raw),
       description = excluded.description,
-      last_seen = excluded.last_seen
+      last_seen = excluded.last_seen,
+      capabilities = COALESCE(excluded.capabilities, items.capabilities),
+      license = COALESCE(excluded.license, items.license),
+      source = COALESCE(excluded.source, items.source)
   `);
   stmt.run({
     id: item.id,
@@ -144,9 +184,30 @@ export function upsertItem(item: {
     scope: item.scope,
     config_path: item.config_path,
     launch_command: item.launch_command,
+    launch_command_raw: (item as any).launch_command_raw ?? null,
     description: item.description,
     last_seen: item.last_seen,
+    introspection_status: (item as any).introspection_status ?? null,
+    introspection_error: (item as any).introspection_error ?? null,
+    introspected_at: (item as any).introspected_at ?? null,
+    capabilities: (item as any).capabilities ?? null,
+    license: (item as any).license ?? null,
+    source: (item as any).source ?? null,
   });
+}
+
+export function setIntrospectionResult(itemId: string, ok: boolean, error?: string): void {
+  db.prepare(
+    `UPDATE items SET introspection_status = ?, introspection_error = ?, introspected_at = ? WHERE id = ?`,
+  ).run(ok ? 'ok' : 'failed', error ?? null, new Date().toISOString(), itemId);
+}
+
+export function setItemCapabilities(itemId: string, capabilities: string): void {
+  db.prepare(`UPDATE items SET capabilities = ? WHERE id = ?`).run(capabilities, itemId);
+}
+
+export function setItemLicense(itemId: string, license: string | null, source: string | null): void {
+  db.prepare(`UPDATE items SET license = ?, source = ? WHERE id = ?`).run(license, source, itemId);
 }
 
 export function getAllItems(): any[] {
@@ -300,10 +361,11 @@ export function createSnapshot(snapshot: {
   description?: string;
   items_json: string;
   tools_json: string;
+  files_json?: string;
 }): void {
   const stmt = db.prepare(`
-    INSERT INTO snapshots (id, created_at, name, description, items_json, tools_json)
-    VALUES (@id, @created_at, @name, @description, @items_json, @tools_json)
+    INSERT INTO snapshots (id, created_at, name, description, items_json, tools_json, files_json)
+    VALUES (@id, @created_at, @name, @description, @items_json, @tools_json, @files_json)
   `);
   stmt.run({
     id: snapshot.id,
@@ -312,6 +374,7 @@ export function createSnapshot(snapshot: {
     description: snapshot.description,
     items_json: snapshot.items_json,
     tools_json: snapshot.tools_json,
+    files_json: snapshot.files_json ?? null,
   });
 }
 
@@ -320,7 +383,7 @@ export function getSnapshot(snapshotId: string): any | null {
 }
 
 export function getAllSnapshots(): any[] {
-  return db.prepare('SELECT id, created_at, name, description, items_json, tools_json FROM snapshots ORDER BY created_at DESC').all();
+  return db.prepare('SELECT id, created_at, name, description, items_json, tools_json, files_json FROM snapshots ORDER BY created_at DESC').all();
 }
 
 export function deleteSnapshot(snapshotId: string): void {

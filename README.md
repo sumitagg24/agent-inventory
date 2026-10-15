@@ -33,10 +33,11 @@ agentinv serve                # local dashboard on http://localhost:3000
 | `inspect <name> [--no-cache] [--yes]` | Detail + opt-in MCP introspection (`tools/list`) |
 | `introspect-all [--yes]` | Introspect every MCP (cached, 24h) |
 | `search <term>` | Full-text across names, descriptions, agents, tool names |
+| `licenses [--refresh]` | License + provenance for MCP packages (npm/PyPI registry lookup, cached) |
 | `doctor [--fix]` | Missing configs, malformed JSON, missing binaries, secrets |
 | `export <file.json\|yaml>` | Redacted inventory export |
-| `snapshot <name>` / `snapshots` / `snapshot-delete <id>` | Named inventory snapshots + deletion |
-| `restore <snapshot> [--apply]` | Dry-run restore plan (plan-only in v1, secrets re-added manually) |
+| `snapshot <name>` / `snapshots` / `snapshot-delete <id>` | Named bundles: inventory + config/SKILL.md file contents (secrets redacted) |
+| `restore <snapshot> [--apply]` | Dry-run plan; `--apply` writes bundled files back (secrets re-added manually) |
 | `drift <snapshot>` / `drift --scans a,b` | Added/removed/changed diff |
 | `scans` | Scan history |
 | `usage [--days 30]` | Active vs dormant rollup |
@@ -76,6 +77,20 @@ agentinv serve --port 3000
 
 Views: all items (search/filter), item detail with tools, by-agent grouping, doctor, usage.
 
+## Automated Background Scanning (Windows)
+
+A scheduled scanner script is provided at `scripts/skills-and-mcps-scanner.ps1` to automatically scan skills and MCP configs and update JSON/Markdown snapshots on change.
+
+### Preventing Console Window Flashes
+
+When running background tasks on Windows:
+1. **Child process suppression:** External commands (such as `npm`, `node`, `git`) called by PowerShell will normally spawn their own console window. Use the included `Invoke-SilentCommand` helper (`CreateNoWindow = $true`) to suppress child windows.
+2. **Initial PowerShell window suppression:** Even with `-WindowStyle Hidden`, `powershell.exe` briefly allocates a console window upon launch. To make background runs 100% silent:
+   - Use `wscript.exe` with `scripts/run-hidden.vbs` as the Task Scheduler action:
+     - **Program/script:** `wscript.exe`
+     - **Arguments:** `"C:\path\to\scripts\run-hidden.vbs" powershell.exe -NoProfile -ExecutionPolicy Bypass -File "C:\path\to\scripts\skills-and-mcps-scanner.ps1"`
+
 ## License
 
 MIT
+

@@ -17,6 +17,10 @@ interface Item {
   description?: string;
   last_seen: string;
   tools?: Tool[];
+  license?: string | null;
+  source?: string | null;
+  capabilities?: string | null;
+  introspection_status?: string | null;
 }
 
 interface Tool {
@@ -275,6 +279,31 @@ function DashboardView({ stats, items, onRunDoctor }: { stats: Stats | null; ite
         </div>
       </div>
 
+      <div className="agent-groups">
+        <h3>By Agent</h3>
+        {[...new Set(items.map(i => i.agent))].sort().map(agent => {
+          const agentItems = items.filter(i => i.agent === agent);
+          return (
+            <details key={agent} className="agent-group">
+              <summary>
+                <span className="agent-badge">{agent}</span>
+                <span className="agent-count">{agentItems.length} item(s) — {agentItems.filter(i => i.kind === 'mcp').length} MCP, {agentItems.filter(i => i.kind === 'skill').length} skills</span>
+              </summary>
+              <ul className="agent-group-list">
+                {agentItems.map(item => (
+                  <li key={item.id}>
+                    <span className="kind-icon">{getKindIcon(item.kind)}</span>
+                    <span className="item-name">{item.name}</span>
+                    <span className="scope-badge">{getScopeBadge(item.scope)}</span>
+                    {item.license && <span className="license-badge">{item.license}</span>}
+                  </li>
+                ))}
+              </ul>
+            </details>
+          );
+        })}
+      </div>
+
       <div className="recent-items">
         <h3>Recent Items</h3>
         <table className="items-table">
@@ -375,13 +404,14 @@ function ItemsView({
               <th>Agent</th>
               <th>Scope</th>
               <th>Launch Command</th>
+              <th>License</th>
               <th>Last Seen</th>
               <th>Actions</th>
             </tr>
           </thead>
           <tbody>
             {items.length === 0 ? (
-              <tr><td colSpan={8} className="empty">No items found</td></tr>
+              <tr><td colSpan={9} className="empty">No items found</td></tr>
             ) : (
               items.map(item => (
                 <tr key={item.id} onClick={() => onItemClick(item)}>
@@ -391,6 +421,7 @@ function ItemsView({
                   <td><span className="agent-badge">{item.agent}</span></td>
                   <td><span className="scope-badge">{getScopeBadge(item.scope)}</span></td>
                   <td className="launch-command">{item.launch_command || '-'}</td>
+                  <td>{item.license ? <span className="license-badge">{item.license}</span> : '-'}</td>
                   <td>{new Date(item.last_seen).toLocaleDateString()}</td>
                   <td><button className="btn small" onClick={(e) => { e.stopPropagation(); onItemClick(item); }}>View</button></td>
                 </tr>

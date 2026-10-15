@@ -11,7 +11,7 @@ import fs from 'fs';
 import path from 'path';
 import matter from 'gray-matter';
 
-import { InstalledItem } from './claude-code.js';
+import { InstalledItem, encodeCapabilities } from './claude-code.js';
 
 interface ProjectScanOptions {
   rootDir: string;
@@ -200,6 +200,7 @@ function parseClaudeCodeSkillsDir(skillsDir: string, scope: 'user' | 'project', 
               config_path: fullPath,
               description: data.description as string | undefined,
               last_seen: new Date().toISOString(),
+              capabilities: encodeCapabilities(data),
             });
           }
         } catch (err) {
@@ -267,6 +268,7 @@ function parseCursorRulesDir(rulesDir: string, scope: 'user' | 'project', config
               config_path: fullPath,
               description: data.description as string | undefined,
               last_seen: new Date().toISOString(),
+              capabilities: encodeCapabilities(data),
             });
           }
         } catch (err) {

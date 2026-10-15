@@ -585,3 +585,11 @@ body {
 .scrollbar-thin::-webkit-scrollbar-thumb:hover {
   background: var(--text-secondary);
 }
+/* Agent-grouped view (plan 3.5) */
+.agent-groups { margin: 20px 0; }
+.agent-group { border: 1px solid var(--border, #e1e5e9); border-radius: 8px; margin-bottom: 8px; padding: 8px 12px; background: var(--surface, #fff); }
+.agent-group summary { cursor: pointer; display: flex; align-items: center; gap: 10px; }
+.agent-count { color: var(--text-secondary, #6b7280); font-size: 13px; }
+.agent-group-list { list-style: none; margin: 8px 0 4px; padding: 0 0 0 12px; }
+.agent-group-list li { display: flex; align-items: center; gap: 8px; padding: 4px 0; }
+.license-badge { display: inline-block; padding: 2px 8px; border-radius: 10px; background: #eef2ff; color: #4338ca; font-size: 12px; }
