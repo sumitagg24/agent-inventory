@@ -1,0 +1,35 @@
+{
+  "name": "agent-inventory",
+  "version": "0.1.0",
+  "description": "Cross-agent inventory tool for MCP servers and Skills",
+  "main": "dist/cli/index.js",
+  "type": "module",
+  "bin": {
+    "agentinv": "dist/cli/index.js"
+  },
+  "scripts": {
+    "build": "tsc",
+    "dev": "ts-node --esm src/cli/index.ts",
+    "start": "node dist/cli/index.js",
+    "test": "echo \"Error: no test specified\" && exit 1",
+    "prepare": "npm run build"
+  },
+  "keywords": ["mcp", "skills", "ai", "coding-agents", "inventory"],
+  "author": "",
+  "license": "ISC",
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.32.1",
+    "better-sqlite3": "^13.0.3",
+    "chalk": "^6.0.1",
+    "commander": "^15.0.0",
+    "dotenv": "^18.0.8",
+    "fast-glob": "^3.3.3",
+    "gray-matter": "^4.0.3"
+  },
+  "devDependencies": {
+    "@types/better-sqlite3": "^9.6.0",
+    "@types/node": "^26.6.5",
+    "ts-node": "^10.9.2",
+    "typescript": "^7.0.2"
+  }
+}
