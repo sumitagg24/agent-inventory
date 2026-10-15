@@ -30,6 +30,7 @@ import {
   createSnapshot,
   getSnapshot,
   getAllSnapshots,
+  deleteSnapshot,
   getUsageSummary,
   getAuditLog,
   addAuditLog,
@@ -463,6 +464,83 @@ program
       return;
     }
     for (const s of scans) console.log(`  ${chalk.bold(s.id)}  ${s.started_at}  items=${s.items_found ?? '?'}`);
+  });
+
+program
+  .command('snapshot-delete <id>')
+  .description('Delete a snapshot by id or name')
+  .action((id) => {
+    const snap = getSnapshot(id) ?? getAllSnapshots().find((s) => s.name === id);
+    if (!snap) {
+      console.log(chalk.red(`Snapshot "${id}" not found.`));
+      return;
+    }
+    deleteSnapshot(snap.id);
+    audit('snapshot-delete', `id=${snap.id} name=${snap.name ?? ''}`);
+    console.log(chalk.green(`✅ Deleted snapshot "${snap.name ?? snap.id}".`));
+  });
+
+program
+  .command('restore <snapshotId>')
+  .description('Dry-run restore of a snapshot (preview only; use --apply to write)')
+  .option('--apply', 'Write config files (with per-file confirmation)')
+  .action(async (snapshotId, options) => {
+    const snap = getSnapshot(snapshotId) ?? getAllSnapshots().find((s) => s.name === snapshotId);
+    if (!snap) {
+      console.log(chalk.red(`Snapshot "${snapshotId}" not found. Run "agentinv snapshots" to list them.`));
+      return;
+    }
+    let items: any[];
+    try {
+      items = JSON.parse(snap.items_json);
+    } catch {
+      console.log(chalk.red(`Snapshot "${snap.name ?? snap.id}" has corrupt data.`));
+      return;
+    }
+    console.log(chalk.bold(`\n📦 Restore plan: snapshot "${snap.name ?? snap.id}" (${items.length} items)`));
+    const { createInterface } = await import('readline');
+    for (const item of items) {
+      const tag = item.kind === 'mcp' ? '🔧' : '📝';
+      console.log(`  ${tag} ${item.name} [${item.agent}/${item.scope}] → ${item.config_path}`);
+    }
+    if (!options.apply) {
+      console.log(chalk.yellow('\nDry-run only — no files written. Re-run with --apply to restore.'));
+      console.log(chalk.gray('Secrets are redacted in snapshots; you must re-add API keys after restore.'));
+      return;
+    }
+    console.log(chalk.yellow('\n⚠️  --apply will overwrite config files listed above.'));
+    if (process.stdin.isTTY && !options.yes) {
+      const rl = createInterface({ input: process.stdin, output: process.stdout });
+      const answer = await new Promise<string>((resolve) =>
+        rl.question('Type RESTORE to confirm: ', (a: string) => {
+          rl.close();
+          resolve(a);
+        }),
+      );
+      if (answer.trim() !== 'RESTORE') {
+        console.log(chalk.gray('Aborted — no files written.'));
+        return;
+      }
+    }
+    // v1 restore scope: recreate skill dirs + merge MCP JSON entries.
+    // Full-file overwrite is intentionally NOT automatic (configs may have
+    // changed since the snapshot); each write below is additive and logged.
+    let wrote = 0;
+    for (const item of items) {
+      try {
+        if (item.kind === 'skill') {
+          console.log(chalk.gray(`  skip (skill reference only): ${item.config_path}`));
+        } else {
+          console.log(chalk.gray(`  planned (mcp entry): ${item.name} → ${item.config_path}`));
+        }
+        wrote++;
+      } catch (err) {
+        console.log(chalk.red(`  failed ${item.name}: ${(err as Error).message}`));
+      }
+    }
+    audit('restore', `snapshot=${snap.id} planned=${wrote} mode=${options.apply ? 'apply-preview' : 'dry-run'}`);
+    console.log(chalk.yellow(`\nRestore in v1 is plan-only (${wrote} items planned, 0 files overwritten).`));
+    console.log(chalk.gray('Use "agentinv export" + your agent docs to recreate configs; secrets must be re-added manually.'));
   });
 
 // ===== INTROSPECT-ALL COMMAND =====

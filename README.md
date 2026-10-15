@@ -35,7 +35,8 @@ agentinv serve                # local dashboard on http://localhost:3000
 | `search <term>` | Full-text across names, descriptions, agents, tool names |
 | `doctor [--fix]` | Missing configs, malformed JSON, missing binaries, secrets |
 | `export <file.json\|yaml>` | Redacted inventory export |
-| `snapshot <name>` / `snapshots` | Named inventory snapshots |
+| `snapshot <name>` / `snapshots` / `snapshot-delete <id>` | Named inventory snapshots + deletion |
+| `restore <snapshot> [--apply]` | Dry-run restore plan (plan-only in v1, secrets re-added manually) |
 | `drift <snapshot>` / `drift --scans a,b` | Added/removed/changed diff |
 | `scans` | Scan history |
 | `usage [--days 30]` | Active vs dormant rollup |
