@@ -17,7 +17,7 @@ import { scanWindsurf } from '../scanners/windsurf.js';
 import { scanClaudeDesktop } from '../scanners/claude-desktop.js';
 import { scanVSCode } from '../scanners/vscode.js';
 import { scanProjects } from '../scanners/project.js';
-import { upsertItem, getAllItems, getItemById, getToolsByItemId, recordScan, getLatestScan, getDb } from '../storage/sqlite.js';
+import { upsertItem, getAllItems, getItemById, getToolsByItemId, recordScan, recordScanItem, getLatestScan, getDb } from '../storage/sqlite.js';
 import { inspectMcp } from '../introspection/mcp.js';
 import type { InstalledItem } from '../scanners/claude-code.js';
 
