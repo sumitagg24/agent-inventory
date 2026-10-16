@@ -9,14 +9,15 @@
 
 import fs from 'fs';
 import path from 'path';
-import matter from 'gray-matter';
+import { readJsonFile, readMarkdownFile } from './io.js';
+import { parseFrontmatter, metadataString } from './frontmatter.js';
+import { formatMcpLaunchSummary, redactSensitiveText } from '../security/redaction.js';
 
 import { InstalledItem } from './claude-code.js';
 
 interface ProjectScanOptions {
   rootDir: string;
   maxDepth?: number;
-  includePatterns?: string[];
   excludePatterns?: string[];
 }
 
@@ -38,17 +39,21 @@ export function scanProjects(options: ProjectScanOptions): InstalledItem[] {
   const {
     rootDir,
     maxDepth = 3,
-    includePatterns = ['**'],
-    excludePatterns = ['**/node_modules/**', '**/.git/**', '**/dist/**', '**/build/**', '**/.next/**'],
+    excludePatterns = ['**/node_modules/**', '**/.git/**', '**/dist/**', '**/build/**', '**/.next/**', '**/.venv/**', '**/.cache/**', '**/.turbo/**', '**/coverage/**', '**/target/**'],
   } = options;
+
+  if (!Number.isInteger(maxDepth) || maxDepth < 0 || maxDepth > 20) {
+    throw new RangeError('maxDepth must be an integer between 0 and 20.');
+  }
 
   const items: InstalledItem[] = [];
   const visited = new Set<string>();
 
   function shouldExclude(dir: string): boolean {
+    const normalized = `${path.resolve(dir).split(path.sep).join('/')}/`;
     for (const pattern of excludePatterns) {
       const regex = new RegExp(pattern.replace(/\*\*/g, '.*').replace(/\*/g, '[^/]*'));
-      if (regex.test(dir)) return true;
+      if (regex.test(normalized)) return true;
     }
     return false;
   }
@@ -65,7 +70,12 @@ export function scanProjects(options: ProjectScanOptions): InstalledItem[] {
 
     // Recurse into subdirectories
     try {
-      const entries = fs.readdirSync(dir, { withFileTypes: true });
+      let entries: fs.Dirent[];
+    try {
+      entries = fs.readdirSync(dir, { withFileTypes: true });
+    } catch {
+      return;
+    }
       for (const entry of entries) {
         if (entry.isDirectory()) {
           walkDir(path.join(dir, entry.name), depth + 1);
@@ -90,7 +100,7 @@ function scanProjectDir(dir: string): InstalledItem[] {
   const claudeMcpPath = path.join(dir, '.mcp.json');
   if (fs.existsSync(claudeMcpPath)) {
     try {
-      const config = JSON.parse(fs.readFileSync(claudeMcpPath, 'utf-8'));
+      const config = readJsonFile(claudeMcpPath);
       items.push(...parseClaudeCodeMCPConfig(config, 'project', claudeMcpPath));
     } catch (err) {
       // Skip malformed
@@ -100,14 +110,14 @@ function scanProjectDir(dir: string): InstalledItem[] {
   // Claude Code: .claude/skills/
   const claudeSkillsDir = path.join(dir, '.claude', 'skills');
   if (fs.existsSync(claudeSkillsDir)) {
-    items.push(...parseClaudeCodeSkillsDir(claudeSkillsDir, 'project', claudeSkillsDir));
+    items.push(...parseClaudeCodeSkillsDir(claudeSkillsDir, 'project'));
   }
 
   // Cursor: .cursor/mcp.json
   const cursorMcpPath = path.join(dir, '.cursor', 'mcp.json');
   if (fs.existsSync(cursorMcpPath)) {
     try {
-      const config = JSON.parse(fs.readFileSync(cursorMcpPath, 'utf-8'));
+      const config = readJsonFile(cursorMcpPath);
       items.push(...parseCursorMCPConfig(config, 'project', cursorMcpPath));
     } catch (err) {
       // Skip malformed
@@ -117,14 +127,14 @@ function scanProjectDir(dir: string): InstalledItem[] {
   // Cursor: .cursor/rules/
   const cursorRulesDir = path.join(dir, '.cursor', 'rules');
   if (fs.existsSync(cursorRulesDir)) {
-    items.push(...parseCursorRulesDir(cursorRulesDir, 'project', cursorRulesDir));
+    items.push(...parseCursorRulesDir(cursorRulesDir, 'project'));
   }
 
   // Windsurf: .windsurf/mcp_config.json
   const windsurfMcpPath = path.join(dir, '.windsurf', 'mcp_config.json');
   if (fs.existsSync(windsurfMcpPath)) {
     try {
-      const config = JSON.parse(fs.readFileSync(windsurfMcpPath, 'utf-8'));
+      const config = readJsonFile(windsurfMcpPath);
       items.push(...parseWindsurfMCPConfig(config, 'project', windsurfMcpPath));
     } catch (err) {
       // Skip malformed
@@ -135,7 +145,7 @@ function scanProjectDir(dir: string): InstalledItem[] {
   const vscodeMcpPath = path.join(dir, '.vscode', 'mcp.json');
   if (fs.existsSync(vscodeMcpPath)) {
     try {
-      const config = JSON.parse(fs.readFileSync(vscodeMcpPath, 'utf-8'));
+      const config = readJsonFile(vscodeMcpPath);
       items.push(...parseVSCodeMCPConfig(config, 'project', vscodeMcpPath));
     } catch (err) {
       // Skip malformed
@@ -155,12 +165,7 @@ function parseClaudeCodeMCPConfig(config: any, scope: 'user' | 'project', config
     if (!serverConfig || typeof serverConfig !== 'object') continue;
 
     const typedConfig = serverConfig as MCPServerConfig;
-    let launchCmd: string | undefined;
-    if (typedConfig.type === 'http' && typedConfig.url) {
-      launchCmd = `${typedConfig.type} ${typedConfig.url}`;
-    } else if (typedConfig.command) {
-      launchCmd = `${typedConfig.command} ${(typedConfig.args || []).join(' ')}`;
-    }
+    const launchCmd = formatMcpLaunchSummary(typedConfig);
 
     items.push({
       id: `${serverName}@claude-code@${scope}@${configPath}`,
@@ -170,35 +175,42 @@ function parseClaudeCodeMCPConfig(config: any, scope: 'user' | 'project', config
       scope,
       config_path: configPath,
       launch_command: launchCmd,
-      description: typedConfig.description,
+      description: typeof typedConfig.description === 'string' ? redactSensitiveText(typedConfig.description) : undefined,
       last_seen: new Date().toISOString(),
     });
   }
   return items;
 }
 
-function parseClaudeCodeSkillsDir(skillsDir: string, scope: 'user' | 'project', configPath: string): InstalledItem[] {
+function parseClaudeCodeSkillsDir(skillsDir: string, scope: 'user' | 'project'): InstalledItem[] {
   const items: InstalledItem[] = [];
 
   function walkDir(dir: string): void {
-    const entries = fs.readdirSync(dir, { withFileTypes: true });
+    let entries: fs.Dirent[];
+    try {
+      entries = fs.readdirSync(dir, { withFileTypes: true });
+    } catch {
+      return;
+    }
     for (const entry of entries) {
       const fullPath = path.join(dir, entry.name);
       if (entry.isDirectory()) {
         walkDir(fullPath);
       } else if (entry.name === 'SKILL.md') {
         try {
-          const fileContent = fs.readFileSync(fullPath, 'utf-8');
-          const { data } = matter(fileContent);
-          if (data && data.name) {
+          const fileContent = readMarkdownFile(fullPath);
+          const data = parseFrontmatter(fileContent);
+          const name = metadataString(data, 'name');
+          if (name) {
+            const description = metadataString(data, 'description');
             items.push({
-              id: `${data.name}@claude-code@${scope}@${path.basename(fullPath)}`,
+              id: `${name}@claude-code@${scope}@${path.basename(fullPath)}`,
               kind: 'skill',
-              name: data.name as string,
+              name,
               agent: 'claude-code',
               scope,
               config_path: fullPath,
-              description: data.description as string | undefined,
+              description: description ? redactSensitiveText(description) : undefined,
               last_seen: new Date().toISOString(),
             });
           }
@@ -221,12 +233,7 @@ function parseCursorMCPConfig(config: any, scope: 'user' | 'project', configPath
     if (!serverConfig || typeof serverConfig !== 'object') continue;
 
     const typedConfig = serverConfig as MCPServerConfig;
-    let launchCmd: string | undefined;
-    if (typedConfig.type === 'http' && typedConfig.url) {
-      launchCmd = `${typedConfig.type} ${typedConfig.url}`;
-    } else if (typedConfig.command) {
-      launchCmd = `${typedConfig.command} ${(typedConfig.args || []).join(' ')}`;
-    }
+    const launchCmd = formatMcpLaunchSummary(typedConfig);
 
     items.push({
       id: `${serverName}@cursor@${scope}@${configPath}`,
@@ -236,28 +243,34 @@ function parseCursorMCPConfig(config: any, scope: 'user' | 'project', configPath
       scope,
       config_path: configPath,
       launch_command: launchCmd,
-      description: typedConfig.description,
+      description: typeof typedConfig.description === 'string' ? redactSensitiveText(typedConfig.description) : undefined,
       last_seen: new Date().toISOString(),
     });
   }
   return items;
 }
 
-function parseCursorRulesDir(rulesDir: string, scope: 'user' | 'project', configPath: string): InstalledItem[] {
+function parseCursorRulesDir(rulesDir: string, scope: 'user' | 'project'): InstalledItem[] {
   const items: InstalledItem[] = [];
 
   function walkDir(dir: string): void {
-    const entries = fs.readdirSync(dir, { withFileTypes: true });
+    let entries: fs.Dirent[];
+    try {
+      entries = fs.readdirSync(dir, { withFileTypes: true });
+    } catch {
+      return;
+    }
     for (const entry of entries) {
       const fullPath = path.join(dir, entry.name);
       if (entry.isDirectory()) {
         walkDir(fullPath);
       } else if (entry.name.endsWith('.mdc')) {
         try {
-          const fileContent = fs.readFileSync(fullPath, 'utf-8');
-          const { data } = matter(fileContent);
-          if (data && (data.name || data.description)) {
-            const skillName = data.name as string || path.basename(fullPath, '.mdc');
+          const fileContent = readMarkdownFile(fullPath);
+          const data = parseFrontmatter(fileContent);
+          const description = metadataString(data, 'description');
+          const skillName = metadataString(data, 'name') || path.basename(fullPath, '.mdc');
+          if (description || data.name) {
             items.push({
               id: `${skillName}@cursor@${scope}@${path.basename(fullPath)}`,
               kind: 'skill',
@@ -265,7 +278,7 @@ function parseCursorRulesDir(rulesDir: string, scope: 'user' | 'project', config
               agent: 'cursor',
               scope,
               config_path: fullPath,
-              description: data.description as string | undefined,
+              description: description ? redactSensitiveText(description) : undefined,
               last_seen: new Date().toISOString(),
             });
           }
@@ -296,12 +309,7 @@ function parseWindsurfMCPConfig(config: any, scope: 'user' | 'project', configPa
     if (!serverConfig || typeof serverConfig !== 'object') continue;
 
     const typedConfig = serverConfig as MCPServerConfig;
-    let launchCmd: string | undefined;
-    if (typedConfig.type === 'http' && typedConfig.url) {
-      launchCmd = `${typedConfig.type} ${typedConfig.url}`;
-    } else if (typedConfig.command) {
-      launchCmd = `${typedConfig.command} ${(typedConfig.args || []).join(' ')}`;
-    }
+    const launchCmd = formatMcpLaunchSummary(typedConfig);
 
     items.push({
       id: `${serverName}@windsurf@${scope}@${configPath}`,
@@ -311,7 +319,7 @@ function parseWindsurfMCPConfig(config: any, scope: 'user' | 'project', configPa
       scope,
       config_path: configPath,
       launch_command: launchCmd,
-      description: typedConfig.description,
+      description: typeof typedConfig.description === 'string' ? redactSensitiveText(typedConfig.description) : undefined,
       last_seen: new Date().toISOString(),
     });
   }
@@ -326,12 +334,7 @@ function parseVSCodeMCPConfig(config: any, scope: 'user' | 'project', configPath
     if (!serverConfig || typeof serverConfig !== 'object') continue;
 
     const typedConfig = serverConfig as MCPServerConfig;
-    let launchCmd: string | undefined;
-    if (typedConfig.type === 'http' && typedConfig.url) {
-      launchCmd = `${typedConfig.type} ${typedConfig.url}`;
-    } else if (typedConfig.command) {
-      launchCmd = `${typedConfig.command} ${(typedConfig.args || []).join(' ')}`;
-    }
+    const launchCmd = formatMcpLaunchSummary(typedConfig);
 
     items.push({
       id: `${serverName}@vscode@${scope}@${configPath}`,
@@ -341,7 +344,7 @@ function parseVSCodeMCPConfig(config: any, scope: 'user' | 'project', configPath
       scope,
       config_path: configPath,
       launch_command: launchCmd,
-      description: typedConfig.description,
+      description: typeof typedConfig.description === 'string' ? redactSensitiveText(typedConfig.description) : undefined,
       last_seen: new Date().toISOString(),
     });
   }

@@ -14,8 +14,10 @@
 
 import fs from 'fs';
 import path from 'path';
+import { readJsonFile, readMarkdownFile } from './io.js';
 import os from 'os';
-import matter from 'gray-matter';
+import { parseFrontmatter, metadataString } from './frontmatter.js';
+import { formatMcpLaunchSummary, redactSensitiveText } from '../security/redaction.js';
 
 import { InstalledItem } from './claude-code.js';
 
@@ -62,7 +64,7 @@ function scanCursorMCP(): InstalledItem[] {
   const userConfigPath = expandUser('~/.cursor/mcp.json');
   if (fs.existsSync(userConfigPath)) {
     try {
-      const userConfig = JSON.parse(fs.readFileSync(userConfigPath, 'utf-8'));
+      const userConfig = readJsonFile(userConfigPath);
       const userItems = parseCursorMCPConfig(userConfig, 'user');
       items.push(...userItems);
     } catch (err) {
@@ -74,7 +76,7 @@ function scanCursorMCP(): InstalledItem[] {
   const projectMcpPath = path.join(process.cwd(), '.cursor', 'mcp.json');
   if (fs.existsSync(projectMcpPath)) {
     try {
-      const projectConfig = JSON.parse(fs.readFileSync(projectMcpPath, 'utf-8'));
+      const projectConfig = readJsonFile(projectMcpPath);
       const projectItems = parseCursorMCPConfig(projectConfig, 'project');
       items.push(...projectItems);
     } catch (err) {
@@ -98,13 +100,7 @@ function parseCursorMCPConfig(config: any, scope: 'user' | 'project'): Installed
     if (!serverConfig || typeof serverConfig !== 'object') continue;
 
     const typedConfig = serverConfig as MCPServerConfig;
-    let launchCmd: string | undefined;
-
-    if (typedConfig.type === 'http' && typedConfig.url) {
-      launchCmd = `${typedConfig.type} ${typedConfig.url}`;
-    } else if (typedConfig.command) {
-      launchCmd = `${typedConfig.command} ${(typedConfig.args || []).join(' ')}`;
-    }
+    const launchCmd = formatMcpLaunchSummary(typedConfig);
 
     items.push({
       id: `${serverName}@cursor@${scope}`,
@@ -153,7 +149,12 @@ function parseCursorRulesDir(rulesDir: string, scope: 'user' | 'project'): Insta
   const items: InstalledItem[] = [];
 
   function walkDir(dir: string): void {
-    const entries = fs.readdirSync(dir, { withFileTypes: true });
+    let entries: fs.Dirent[];
+    try {
+      entries = fs.readdirSync(dir, { withFileTypes: true });
+    } catch {
+      return;
+    }
 
     for (const entry of entries) {
       const fullPath = path.join(dir, entry.name);
@@ -161,11 +162,11 @@ function parseCursorRulesDir(rulesDir: string, scope: 'user' | 'project'): Insta
         walkDir(fullPath);
       } else if (entry.name.endsWith('.mdc')) {
         try {
-          const fileContent = fs.readFileSync(fullPath, 'utf-8');
-          const { data } = matter(fileContent);
-
-          if (data && (data.name || data.description)) {
-            const skillName = data.name as string || path.basename(fullPath, '.mdc');
+          const fileContent = readMarkdownFile(fullPath);
+          const data = parseFrontmatter(fileContent);
+          const description = metadataString(data, 'description');
+          const skillName = metadataString(data, 'name') || path.basename(fullPath, '.mdc');
+          if (description || data.name) {
             items.push({
               id: `${skillName}@cursor@${scope}@${path.basename(fullPath)}`,
               kind: 'skill',
@@ -173,7 +174,7 @@ function parseCursorRulesDir(rulesDir: string, scope: 'user' | 'project'): Insta
               agent: 'cursor',
               scope,
               config_path: fullPath,
-              description: data.description as string | undefined,
+              description: description ? redactSensitiveText(description) : undefined,
               last_seen: new Date().toISOString(),
             });
           }

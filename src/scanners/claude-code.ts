@@ -14,8 +14,10 @@
 
 import fs from 'fs';
 import path from 'path';
+import { readJsonFile, readMarkdownFile } from './io.js';
 import os from 'os';
-import matter from 'gray-matter';
+import { parseFrontmatter, metadataString } from './frontmatter.js';
+import { formatMcpLaunchSummary, redactSensitiveText } from '../security/redaction.js';
 
 function expandUser(p: string): string {
   if (p.startsWith('~')) {
@@ -77,7 +79,7 @@ function scanClaudeCodeMCP(): InstalledItem[] {
   const userConfigPath = expandUser('~/.claude.json');
   if (fs.existsSync(userConfigPath)) {
     try {
-      const userConfig = JSON.parse(fs.readFileSync(userConfigPath, 'utf-8'));
+      const userConfig = readJsonFile(userConfigPath);
       const userItems = parseClaudeCodeMCPConfig(userConfig, 'user');
       items.push(...userItems);
     } catch (err) {
@@ -89,7 +91,7 @@ function scanClaudeCodeMCP(): InstalledItem[] {
   const projectMcpPath = path.join(process.cwd(), '.mcp.json');
   if (fs.existsSync(projectMcpPath)) {
     try {
-      const projectConfig = JSON.parse(fs.readFileSync(projectMcpPath, 'utf-8'));
+      const projectConfig = readJsonFile(projectMcpPath);
       const projectItems = parseClaudeCodeMCPConfig(projectConfig, 'project');
       items.push(...projectItems);
     } catch (err) {
@@ -112,13 +114,7 @@ function parseClaudeCodeMCPConfig(config: any, scope: 'user' | 'project'): Insta
     if (!serverConfig || typeof serverConfig !== 'object') continue;
 
     const typedConfig = serverConfig as MCPServerConfig;
-    let launchCmd: string | undefined;
-
-    if (typedConfig.type === 'http' && typedConfig.url) {
-      launchCmd = `${typedConfig.type} ${typedConfig.url}`;
-    } else if (typedConfig.command) {
-      launchCmd = `${typedConfig.command} ${(typedConfig.args || []).join(' ')}`;
-    }
+    const launchCmd = formatMcpLaunchSummary(typedConfig);
 
     items.push({
       id: `${serverName}@claude-code@${scope}`,
@@ -128,7 +124,7 @@ function parseClaudeCodeMCPConfig(config: any, scope: 'user' | 'project'): Insta
       scope,
       config_path: scope === 'user' ? '~/.claude.json' : path.resolve(process.cwd(), '.mcp.json'),
       launch_command: launchCmd,
-      description: typedConfig.description,
+      description: typeof typedConfig.description === 'string' ? redactSensitiveText(typedConfig.description) : undefined,
       last_seen: new Date().toISOString(),
     });
   }
@@ -175,18 +171,19 @@ function parseClaudeCodeSkillsDir(skillsDir: string, scope: 'user' | 'project'):
       items.push(...subItems);
     } else if (entry.name === 'SKILL.md') {
       try {
-        const fileContent = fs.readFileSync(fullPath, 'utf-8');
-        const { data } = matter(fileContent);
-
-        if (data && data.name) {
+        const fileContent = readMarkdownFile(fullPath);
+        const data = parseFrontmatter(fileContent);
+        const name = metadataString(data, 'name');
+        if (name) {
+          const description = metadataString(data, 'description');
           items.push({
-            id: `${data.name}@claude-code@${scope}@${path.basename(fullPath)}`,
+            id: `${name}@claude-code@${scope}@${path.basename(fullPath)}`,
             kind: 'skill',
-            name: data.name as string,
+            name,
             agent: 'claude-code',
             scope,
             config_path: fullPath,
-            description: data.description as string | undefined,
+            description: description ? redactSensitiveText(description) : undefined,
             last_seen: new Date().toISOString(),
           });
         }
