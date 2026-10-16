@@ -70,6 +70,12 @@ Prefer `scan` and `doctor` for static inventory and health checks. The `serve` c
 
 Agent Inventory does **not** install or enable recurring scans. It does not ship a hidden PowerShell/VBScript launcher or an automatic Task Scheduler/LaunchAgent/cron configuration. Run `scan` manually in a terminal unless you deliberately create your own scheduled job after reviewing the command and its permissions. There is no supported claim that a hidden launcher prevents all console flashes or is preferable for security.
 
+## Known Windows behavior
+
+MCP clients that launch servers through `npx -y <package>` (for example `npx -y "@playwright/mcp"`) spawn a `cmd.exe` process on Windows, which shows a brief `conhost.exe` console window once per server. That console flash is the MCP client's own behavior—Agent Inventory does not spawn `npx`, `cmd.exe`, or any MCP server during `scan`, and it never installs a recurring job or hidden launcher.
+
+During an explicitly approved `inspect <name>` or `introspect-all`, Agent Inventory starts the configured stdio command through the MCP SDK, which sets `windowsHide: true` on Windows. To avoid the console flash entirely, install MCP servers globally (e.g. `npm install -g @playwright/mcp`) and point your MCP client at the installed binary as the configured `command` instead of using `npx -y`.
+
 ## Security software and false positives
 
 This project does not attempt to bypass Microsoft Defender, McAfee, macOS Gatekeeper/XProtect, or other security products. It uses no obfuscation, persistence, hidden-task installation, or security exclusions. No open-source project can guarantee that every antivirus product will never flag it: detections depend on signatures, reputation, dependencies, build environment, and heuristic rules. If you receive an alert, do not disable protection or add a broad exclusion. Verify the source/release and file location, scan it, and submit a suspected false positive to the relevant vendor for review.
