@@ -110,7 +110,7 @@ function parseCursorMCPConfig(config: any, scope: 'user' | 'project'): Installed
       scope,
       config_path: scope === 'user' ? '~/.cursor/mcp.json' : path.resolve(process.cwd(), '.cursor', 'mcp.json'),
       launch_command: launchCmd,
-      description: typedConfig.description,
+      description: typeof typedConfig.description === 'string' ? redactSensitiveText(typedConfig.description) : undefined,
       last_seen: new Date().toISOString(),
     });
   }
@@ -189,4 +189,4 @@ function parseCursorRulesDir(rulesDir: string, scope: 'user' | 'project'): Insta
   return items;
 }
 
-export default { scanCursor };
+export default { scanCursor, parseCursorRulesDir };

@@ -93,3 +93,22 @@ test('loads remote HTTP MCP URL and headers without persisting or printing them'
   assert.equal(spec.headers.Authorization, 'Bearer secret-header');
   assert.doesNotMatch(formatLaunchUrl(spec.url), /secret/);
 });
+
+test('Cursor .mdc rule description containing a token is redacted before storage', async (t) => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'agent-inventory-cursor-test-'));
+  t.after(() => fs.rmSync(directory, { recursive: true, force: true }));
+  fs.writeFileSync(
+    path.join(directory, 'rule.mdc'),
+    '---\nname: test-rule\ndescription: Connect with token ghp_abcdefghijklmnopqrstuvwxyz0123456789\n---\n# body\n',
+  );
+
+  const cursorScanner = (await import('../dist/scanners/cursor.js')).default;
+  const { parseCursorRulesDir } = cursorScanner;
+  const items = parseCursorRulesDir(directory, 'project');
+
+  assert.equal(items.length, 1);
+  assert.equal(items[0].name, 'test-rule');
+  assert.equal(items[0].kind, 'skill');
+  assert.doesNotMatch(items[0].description ?? '', /ghp_/);
+  assert.match(items[0].description ?? '', /\[REDACTED]/);
+});
