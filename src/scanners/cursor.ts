@@ -19,7 +19,7 @@ import os from 'os';
 import { parseFrontmatter, metadataString } from './frontmatter.js';
 import { formatMcpLaunchSummary, redactSensitiveText } from '../security/redaction.js';
 
-import { InstalledItem } from './claude-code.js';
+import { InstalledItem, encodeCapabilities } from './claude-code.js';
 
 function expandUser(p: string): string {
   if (p.startsWith('~')) {
@@ -176,6 +176,7 @@ function parseCursorRulesDir(rulesDir: string, scope: 'user' | 'project'): Insta
               config_path: fullPath,
               description: description ? redactSensitiveText(description) : undefined,
               last_seen: new Date().toISOString(),
+              capabilities: encodeCapabilities(data),
             });
           }
         } catch (err) {

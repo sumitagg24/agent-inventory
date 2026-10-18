@@ -2,7 +2,7 @@
 
 A local, CLI-first tool for cataloguing MCP server configurations and skill/rule files across AI coding agents.
 
-> **Current scope:** this is an early implementation of the architecture plan—not the full roadmap. It includes scanners for Claude Code, Cursor, Windsurf, Claude Desktop, VS Code, and explicitly selected project directories, plus a local SQLite store and CLI commands. Codex discovery, snapshots/restore, drift history, a dashboard, usage tracking, team features, and other roadmap items are **not implemented**. See [implementation status](docs/implementation-status.md).
+> **Current scope:** this is an early implementation of the architecture plan—not the full roadmap. It includes scanners for Claude Code, Cursor, Windsurf, Claude Desktop, VS Code, Codex, and explicitly selected project directories, plus a local SQLite store and CLI commands. Snapshots/restore, drift history, licenses, usage tracking, team features, a dashboard, and other roadmap items are partially implemented. See [implementation status](docs/implementation-status.md).
 
 ## Supported scan locations
 
@@ -13,6 +13,7 @@ A local, CLI-first tool for cataloguing MCP server configurations and skill/rule
 | Windsurf | `~/.codeium/windsurf/mcp_config.json` | `.windsurf/mcp_config.json` | — |
 | Claude Desktop | macOS `~/Library/Application Support/Claude/claude_desktop_config.json`; Windows `%APPDATA%\Claude\claude_desktop_config.json`; Linux `$XDG_CONFIG_HOME/Claude/claude_desktop_config.json` (or `~/.config/Claude/...`) | — | — |
 | VS Code | User `settings.json` MCP entries | `.vscode/mcp.json` | — |
+| Codex | `~/.codex/config.toml` | `.codex/mcp.json` | `~/.codex/skills/` (`SKILL.md`) |
 
 `scan-projects <directory>` searches project-level locations below the directory you specify. The default depth is 3; allowed depth is 0–20. It skips common generated/dependency folders and does not recursively follow symlinked child directories.
 
@@ -38,7 +39,12 @@ node dist/cli/index.js search postgres
 node dist/cli/index.js doctor
 node dist/cli/index.js export inventory.json
 node dist/cli/index.js inspect my-mcp
-node dist/cli/index.js introspect-all
+node dist/cli/index.js introspect-all --allow-execution
+node dist/cli/index.js licenses
+node dist/cli/index.js snapshot my-snapshot
+node dist/cli/index.js drift
+node dist/cli/index.js stats
+node dist/cli/index.js team-init
 ```
 
 The scanner is designed for Windows, macOS, and Linux, using the current user's home directory for user-level configs. The automated checks in this checkout ran in a Linux sandbox; native Windows/macOS verification has not yet been performed.
@@ -79,5 +85,56 @@ During an explicitly approved `inspect <name>` or `introspect-all`, Agent Invent
 ## Security software and false positives
 
 This project does not attempt to bypass Microsoft Defender, McAfee, macOS Gatekeeper/XProtect, or other security products. It uses no obfuscation, persistence, hidden-task installation, or security exclusions. No open-source project can guarantee that every antivirus product will never flag it: detections depend on signatures, reputation, dependencies, build environment, and heuristic rules. If you receive an alert, do not disable protection or add a broad exclusion. Verify the source/release and file location, scan it, and submit a suspected false positive to the relevant vendor for review.
+
+## Commands
+
+| Command | What it does |
+|---|---|
+| `scan [--agent <name>]` | Scan all (or one) agent configs + skills into SQLite |
+| `scan-projects <dir>` | Recursively scan a directory tree for project-level configs |
+| `list [--kind mcp\|skill] [--agent <a>]` | Table of installed items |
+| `inspect <name> [--no-cache] [--allow-execution]` | Detail + opt-in MCP introspection (`tools/list`) |
+| `introspect-all [--allow-execution]` | Introspect every MCP (cached, 24h) |
+| `search <term>` | Full-text across names, descriptions, agents, tool names |
+| `licenses [--refresh]` | License + provenance for MCP packages (npm/PyPI registry lookup, cached) |
+| `doctor [--fix]` | Missing configs, malformed JSON, missing binaries, secrets |
+| `export <file.json\|yaml>` | Redacted inventory export |
+| `snapshot <name>` / `snapshots` / `snapshot-delete <id>` | Named bundles: inventory + config/SKILL.md file contents (secrets redacted) |
+| `restore <snapshot> [--apply]` | Dry-run plan; `--apply` writes bundled files back (secrets re-added manually) |
+| `drift <snapshot>` / `drift --scans a,b` | Added/removed/changed diff |
+| `scans` | Scan history |
+| `stats` | Counts by kind/agent + 30d activity |
+| `serve [--port 3000]` | Local dashboard (API + UI) |
+| `team-init` / `team-check [file]` / `onboard [file]` | Team baseline, CI check, onboarding doc |
+| `export-audit <file.csv\|json>` | Compliance export of the audit log |
+
+## Security model
+
+- **Scanning is read-only.** No servers are started by `scan`, `list`, `search`, or `doctor`.
+- **Introspection spawns processes** (`inspect`, `introspect-all`) — always explicit/opt-in with a warning, 10s timeout per server, failures recorded rather than fatal.
+- **Secrets are never logged.** `export` redacts launch commands; `doctor` reports only pattern + location, never values.
+
+## Data
+
+Local SQLite file: `~/.agent-inventory/db.sqlite`. Back it up or delete it freely.
+
+## Team / CI
+
+```bash
+agentinv team-init            # writes sample team.yaml
+agentinv team-check           # exit 1 if required items missing / blocked present
+agentinv onboard -o ONBOARDING.md
+```
+
+See `.github/workflows/agentinv-check.yml` for a drop-in PR check.
+
+## Dashboard
+
+```bash
+npm run build:dashboard
+agentinv serve --port 3000
+```
+
+The dashboard API (`/api/items`, `/api/tools`, `/api/search`, `/api/stats`, `/api/doctor`) serves read-only inventory data. The `/api/export` route is deferred pending a dedicated security review.
 
 See [SECURITY.md](SECURITY.md) for the security model and reporting guidance.

@@ -26,6 +26,18 @@ function expandUser(p: string): string {
   return p;
 }
 
+/** JSON-encode declared capabilities from SKILL.md frontmatter (plan §3.2.3). */
+export function encodeCapabilities(data: Record<string, any>): string | undefined {
+  const raw = data['allowed-tools'] ?? data.allowedTools ?? data.capabilities;
+  if (!raw) return undefined;
+  const list = Array.isArray(raw)
+    ? raw.map(String)
+    : typeof raw === 'string'
+      ? raw.split(/[,\s]+/).filter(Boolean)
+      : null;
+  return list && list.length > 0 ? JSON.stringify(list) : undefined;
+}
+
 interface MCPServerConfig {
   type?: string;
   url?: string;
@@ -49,6 +61,8 @@ export interface InstalledItem {
   launch_command?: string;
   description?: string;
   last_seen: string;
+  /** Declared capabilities (e.g. SKILL.md allowed-tools), JSON array string. */
+  capabilities?: string;
 }
 
 /**
@@ -185,6 +199,7 @@ function parseClaudeCodeSkillsDir(skillsDir: string, scope: 'user' | 'project'):
             config_path: fullPath,
             description: description ? redactSensitiveText(description) : undefined,
             last_seen: new Date().toISOString(),
+            capabilities: encodeCapabilities(data),
           });
         }
       } catch (err) {
