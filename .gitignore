@@ -1,6 +1,15 @@
 node_modules/
 dist/
+.agent-inventory/
+scripts/
+dashboard/dist/
+team.yaml
+ONBOARDING.md
 db.sqlite
+*.sqlite-wal
+*.sqlite-shm
 *.log
 .DS_Store
 .env
+*.agentinv-backup
+/tmp/

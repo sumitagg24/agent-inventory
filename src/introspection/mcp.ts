@@ -1,273 +1,145 @@
 /**
- * Agent Inventory Tool — MCP Introspection Engine
+ * Explicit, opt-in MCP metadata inspection.
  *
- * Boots MCP servers briefly to discover what tools they expose,
- * using the official @modelcontextprotocol/sdk Client with stdio and HTTP transports.
- *
- * Key design decisions:
- * - Uses MCP SDK Client with appropriate transport (not hand-rolled protocol)
- * - Timeout per server (10s) so one slow server doesn't block all
- * - try/catch so one broken server doesn't crash the whole scan
- * - Results cached in SQLite; only re-introspect on explicit request
- * - Opt-in: first time calling inspect on a new server requires user confirmation
+ * `scan` never calls this module. Inspection may start the configured local process or
+ * contact a configured HTTP endpoint, so the CLI asks for consent before invoking it.
+ * Only the MCP initialize/tools/list handshake is made; no MCP tool is called.
  */
 
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
 import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js';
 import type { ClientCapabilities, ListToolsResult } from '@modelcontextprotocol/sdk/types.js';
-import { getDb, getToolsByItemId, upsertTool } from '../storage/sqlite.js';
+import { getLastIntrospected, getToolsByItemId, replaceToolsForItem } from '../storage/sqlite.js';
+import { redactSensitiveObject, redactSensitiveText } from '../security/redaction.js';
+import { readMcpLaunchSpec, type InventoryMcpItem, type McpLaunchSpec } from './launch-spec.js';
 
-const INTROSPECTION_TIMEOUT_MS = 10000; // 10 second timeout per server
-const CACHE_REFRESH_MS = 24 * 60 * 60 * 1000; // refresh daily (24h)
+const INTROSPECTION_TIMEOUT_MS = 10_000;
+const CACHE_REFRESH_MS = 24 * 60 * 60 * 1000;
+const clientCapabilities: ClientCapabilities = {};
 
-// Interface for a discovered tool
 interface DiscoveredTool {
   name: string;
   description: string;
-  input_schema: any;
+  input_schema: unknown;
 }
 
-// Minimal client capabilities for our use case
-const clientCapabilities: ClientCapabilities = {
-  roots: {
-    listChanged: true,
-  },
-};
+export function hasFreshMcpCache(itemId: string): boolean {
+  const inspectedAt = getLastIntrospected(itemId);
+  if (!inspectedAt) return false;
+  const age = Date.now() - Date.parse(inspectedAt);
+  return Number.isFinite(age) && age >= 0 && age < CACHE_REFRESH_MS;
+}
 
-/**
- * Introspect a single MCP server by spawning it and calling tools/list.
- * Supports both stdio and HTTP-based transports.
- * Returns discovered tools or throws on failure.
- */
-export async function inspectMcpServer(
-  launchCommand: string,
-  itemId: string
+async function withTimeout<T>(promise: Promise<T>, label: string): Promise<T> {
+  let timer: NodeJS.Timeout | undefined;
+  try {
+    return await Promise.race([
+      promise,
+      new Promise<T>((_, reject) => {
+        timer = setTimeout(() => reject(new Error(`${label} timed out`)), INTROSPECTION_TIMEOUT_MS);
+      }),
+    ]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+
+/** Run only the MCP handshake and tools/list operation against a configured server. */
+async function inspectMcpServer(
+  spec: McpLaunchSpec,
+  displayName = 'configured server',
 ): Promise<DiscoveredTool[]> {
-  console.log(`  Spawning: ${launchCommand}`);
-
-  // Check if it's an HTTP-based server
-  if (launchCommand.startsWith('http ')) {
-    return inspectHttpMcpServer(launchCommand, itemId);
-  }
-
-  // Parse the command and args for stdio transport
-  const parts = launchCommand.trim().split(/\s+/);
-  const command = parts[0];
-  const args = parts.slice(1);
-
-  let transport: StdioClientTransport;
-  try {
-    transport = new StdioClientTransport({
-      command,
-      args,
-    });
-  } catch (err) {
-    console.log(`  ⚠️  Failed to create transport: ${(err as Error).message}`);
-    return [];
-  }
-
-  const client = new Client(
-    { name: 'agent-inventory', version: '0.1.0' },
-    { capabilities: clientCapabilities }
-  );
+  let transport: StdioClientTransport | StreamableHTTPClientTransport;
+  let client: Client;
 
   try {
-    // Connect and initialize with timeout
-    console.log('  🔌 Initializing...');
-    await Promise.race([
-      client.connect(transport),
-      new Promise((_, reject) =>
-        setTimeout(() => reject(new Error('Initialization timeout')), INTROSPECTION_TIMEOUT_MS)
-      ),
-    ]);
-
-    // Request the list of tools with timeout
-    console.log('  📋 Fetching tools/list...');
-    const listResult = await Promise.race([
-      client.listTools(),
-      new Promise<ListToolsResult>((_, reject) =>
-        setTimeout(() => reject(new Error('listTools timeout')), INTROSPECTION_TIMEOUT_MS)
-      ),
-    ]);
-
-    if (!listResult || !listResult.tools) {
-      console.log('  ⚠️  No tools returned from listTools');
-      return [];
+    if (spec.url) {
+      const headers = spec.headers ? new Headers(spec.headers) : undefined;
+      transport = new StreamableHTTPClientTransport(new URL(spec.url), {
+        requestInit: headers ? { headers } : undefined,
+      });
+    } else if (spec.command) {
+      transport = new StdioClientTransport({
+        command: spec.command,
+        args: spec.args ?? [],
+        env: spec.env,
+        cwd: spec.cwd,
+        // Keep an MCP server's stderr (which may contain credentials) out of the user's terminal.
+        stderr: 'ignore',
+      });
+    } else {
+      throw new Error('No supported MCP launch configuration was found.');
     }
 
-    // Transform into our schema
-    const tools: DiscoveredTool[] = listResult.tools.map((tool: any) => ({
+    client = new Client(
+      { name: 'agent-inventory', version: '0.1.0' },
+      { capabilities: clientCapabilities },
+    );
+  } catch {
+    throw new Error(`Could not prepare MCP inspection for ${redactSensitiveText(displayName)}.`);
+  }
+
+  try {
+    await withTimeout(client.connect(transport), 'MCP initialization');
+    const result: ListToolsResult = await withTimeout(client.listTools(), 'MCP tools/list');
+    return result.tools.map((tool) => ({
       name: tool.name,
       description: tool.description || '',
       input_schema: tool.inputSchema || {},
     }));
-
-    return tools;
-
-  } catch (err) {
-    console.log(`  ❌ Introspection failed: ${(err as Error).message}`);
-    throw err;
+  } catch {
+    // Do not print third-party process/network errors: they can echo secrets from config.
+    throw new Error(`MCP inspection failed for ${redactSensitiveText(displayName)}. No server output was logged.`);
   } finally {
-    // Always close the connection
     try {
       await client.close();
-    } catch (e) {
-      // Ignore close errors
+    } catch {
+      // Cleanup is best-effort; the SDK also terminates stdio children when closing its transport.
     }
   }
 }
 
 /**
- * Introspect an HTTP-based MCP server.
- */
-async function inspectHttpMcpServer(
-  launchCommand: string,
-  itemId: string
-): Promise<DiscoveredTool[]> {
-  // Format: "http <url>"
-  const url = launchCommand.replace(/^http\s+/, '').trim();
-  console.log(`  Connecting to HTTP server: ${url}`);
-
-  let transport: StreamableHTTPClientTransport;
-  try {
-    transport = new StreamableHTTPClientTransport(new URL(url));
-  } catch (err) {
-    console.log(`  ⚠️  Failed to create HTTP transport: ${(err as Error).message}`);
-    return [];
-  }
-
-  const client = new Client(
-    { name: 'agent-inventory', version: '0.1.0' },
-    { capabilities: clientCapabilities }
-  );
-
-  try {
-    // Connect and initialize with timeout
-    console.log('  🔌 Initializing...');
-    await Promise.race([
-      client.connect(transport),
-      new Promise((_, reject) =>
-        setTimeout(() => reject(new Error('Initialization timeout')), INTROSPECTION_TIMEOUT_MS)
-      ),
-    ]);
-
-    // Request the list of tools with timeout
-    console.log('  📋 Fetching tools/list...');
-    const listResult = await Promise.race([
-      client.listTools(),
-      new Promise<ListToolsResult>((_, reject) =>
-        setTimeout(() => reject(new Error('listTools timeout')), INTROSPECTION_TIMEOUT_MS)
-      ),
-    ]);
-
-    if (!listResult || !listResult.tools) {
-      console.log('  ⚠️  No tools returned from listTools');
-      return [];
-    }
-
-    const tools: DiscoveredTool[] = listResult.tools.map((tool: any) => ({
-      name: tool.name,
-      description: tool.description || '',
-      input_schema: tool.inputSchema || {},
-    }));
-
-    return tools;
-
-  } catch (err) {
-    console.log(`  ❌ HTTP Introspection failed: ${(err as Error).message}`);
-    throw err;
-  } finally {
-    try {
-      await client.close();
-    } catch (e) {
-      // Ignore close errors
-    }
-  }
-}
-
-/**
- * Introspect an MCP item from the inventory.
- * Checks cache first; only spawns server if cache is stale or empty.
+ * Inspect an inventory item, using a successful result from the last 24 hours when available.
+ * The raw command, args, environment, URL and headers are re-read from the source config and
+ * are never persisted to the inventory database or printed to the terminal.
  */
 export async function inspectMcp(
-  item: any,
-  useCache: boolean = true
+  item: InventoryMcpItem & { id: string },
+  useCache = true,
+  executionApproved = false,
 ): Promise<{ name: string; description: string; input_schema_json: string }[]> {
-  const itemId = item.id;
-
-  // Check if we have cached tools (less than 24h old)
-  if (useCache) {
-    const cachedTools = getToolsByItemId(itemId);
-    const itemRecord = getDb().prepare('SELECT last_seen FROM items WHERE id = ?').get(itemId) as any;
-    const cacheAge = itemRecord ? new Date().getTime() - new Date(itemRecord.last_seen).getTime() : Infinity;
-
-    if (cachedTools.length > 0 && cacheAge < CACHE_REFRESH_MS) {
-      console.log(`  Using cached results (${Math.round(cacheAge / 1000 / 60)} min old)`);
-      return cachedTools.map((t: any) => ({
-        name: t.tool_name,
-        description: t.tool_description || '',
-        input_schema_json: t.input_schema_json,
-      }));
-    }
+  if (useCache && hasFreshMcpCache(item.id)) {
+    return getToolsByItemId(item.id).map((tool: any) => ({
+      name: tool.tool_name,
+      description: tool.tool_description || '',
+      input_schema_json: tool.input_schema_json || '{}',
+    }));
   }
 
-  // Re-introspect
-  let tools: { name: string; description: string; input_schema: any }[] = [];
-
-  if (item.launch_command) {
-    try {
-      tools = await inspectMcpServer(item.launch_command, itemId);
-    } catch (err) {
-      console.log(`  Could not introspect MCP server for ${item.name}`);
-    }
+  if (!executionApproved) {
+    throw new Error('Explicit approval is required before starting or contacting an MCP server.');
   }
 
-  // Store tools in SQLite for caching
-  for (const tool of tools) {
-    upsertTool({
-      id: `${tool.name}@${itemId}`,
-      item_id: itemId,
-      tool_name: tool.name,
-      tool_description: tool.description,
-      input_schema_json: JSON.stringify(tool.input_schema),
-    });
-  }
+  const launchSpec = readMcpLaunchSpec(item);
+  const discovered = await inspectMcpServer(launchSpec, item.name);
+  const safeTools = discovered.map((tool) => {
+    const name = redactSensitiveText(tool.name);
+    const description = redactSensitiveText(tool.description);
+    const inputSchema = redactSensitiveObject(tool.input_schema);
+    const inputSchemaJson = JSON.stringify(inputSchema);
+    return {
+      id: `${name}@${item.id}`,
+      tool_name: name,
+      tool_description: description,
+      input_schema_json: inputSchemaJson,
+      result: { name, description, input_schema_json: inputSchemaJson },
+    };
+  });
 
-  // Return in the format the CLI expects
-  return tools.map((t) => ({
-    name: t.name,
-    description: t.description,
-    input_schema_json: JSON.stringify(t.input_schema),
-  }));
+  replaceToolsForItem(item.id, safeTools);
+  return safeTools.map(({ result }) => result);
 }
 
-/**
- * Introspect all MCP items in the database.
- * Only introspects items that haven't been introspected recently.
- */
-export async function inspectAllMcpItems(): Promise<void> {
-  const items = getDb().prepare(`
-    SELECT i.* FROM items i
-    LEFT JOIN tools t ON i.id = t.item_id
-    WHERE i.kind = 'mcp'
-    GROUP BY i.id
-    HAVING COUNT(t.id) = 0
-       OR MAX(i.last_seen) IS NULL
-       OR i.last_seen < datetime('now', '-1 day')
-  `).all() as any[];
-
-  console.log(`Found ${items.length} uncached MCP items to introspect...`);
-
-  for (const item of items) {
-    console.log(`\nIntrospecting ${item.name}...`);
-    try {
-      const tools = await inspectMcp(item);
-      console.log(`  ✅ Found ${tools.length} tool(s)`);
-    } catch (err) {
-      console.log(`  ❌ Failed: ${(err as Error).message}`);
-    }
-  }
-}
-
-export default { inspectMcp, inspectMcpServer, inspectAllMcpItems };
+export default { inspectMcp, hasFreshMcpCache };

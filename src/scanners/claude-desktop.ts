@@ -13,9 +13,11 @@
 
 import fs from 'fs';
 import path from 'path';
+import { readJsonFile } from './io.js';
 import os from 'os';
 
 import { InstalledItem } from './claude-code.js';
+import { formatMcpLaunchSummary, redactSensitiveText } from '../security/redaction.js';
 
 interface MCPServerConfig {
   type?: string;
@@ -58,7 +60,7 @@ export function scanClaudeDesktop(): InstalledItem[] {
 
   if (fs.existsSync(configPath)) {
     try {
-      const config = JSON.parse(fs.readFileSync(configPath, 'utf-8'));
+      const config = readJsonFile(configPath);
       const configItems = parseClaudeDesktopMCPConfig(config, configPath);
       items.push(...configItems);
     } catch (err) {
@@ -82,13 +84,7 @@ function parseClaudeDesktopMCPConfig(config: any, configPath: string): Installed
     if (!serverConfig || typeof serverConfig !== 'object') continue;
 
     const typedConfig = serverConfig as MCPServerConfig;
-    let launchCmd: string | undefined;
-
-    if (typedConfig.type === 'http' && typedConfig.url) {
-      launchCmd = `${typedConfig.type} ${typedConfig.url}`;
-    } else if (typedConfig.command) {
-      launchCmd = `${typedConfig.command} ${(typedConfig.args || []).join(' ')}`;
-    }
+    const launchCmd = formatMcpLaunchSummary(typedConfig);
 
     items.push({
       id: `${serverName}@claude-desktop@user`,
@@ -98,7 +94,7 @@ function parseClaudeDesktopMCPConfig(config: any, configPath: string): Installed
       scope: 'user',
       config_path: configPath,
       launch_command: launchCmd,
-      description: typedConfig.description,
+      description: typeof typedConfig.description === 'string' ? redactSensitiveText(typedConfig.description) : undefined,
       last_seen: new Date().toISOString(),
     });
   }

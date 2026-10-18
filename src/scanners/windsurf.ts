@@ -10,9 +10,11 @@
 
 import fs from 'fs';
 import path from 'path';
+import { readJsonFile } from './io.js';
 import os from 'os';
 
 import { InstalledItem } from './claude-code.js';
+import { formatMcpLaunchSummary, redactSensitiveText } from '../security/redaction.js';
 
 function expandUser(p: string): string {
   if (p.startsWith('~')) {
@@ -54,7 +56,7 @@ function scanWindsurfMCP(): InstalledItem[] {
   const userConfigPath = expandUser('~/.codeium/windsurf/mcp_config.json');
   if (fs.existsSync(userConfigPath)) {
     try {
-      const userConfig = JSON.parse(fs.readFileSync(userConfigPath, 'utf-8'));
+      const userConfig = readJsonFile(userConfigPath);
       const userItems = parseWindsurfMCPConfig(userConfig, 'user');
       items.push(...userItems);
     } catch (err) {
@@ -66,7 +68,7 @@ function scanWindsurfMCP(): InstalledItem[] {
   const projectMcpPath = path.join(process.cwd(), '.windsurf', 'mcp_config.json');
   if (fs.existsSync(projectMcpPath)) {
     try {
-      const projectConfig = JSON.parse(fs.readFileSync(projectMcpPath, 'utf-8'));
+      const projectConfig = readJsonFile(projectMcpPath);
       const projectItems = parseWindsurfMCPConfig(projectConfig, 'project');
       items.push(...projectItems);
     } catch (err) {
@@ -103,13 +105,7 @@ function parseWindsurfMCPConfig(config: any, scope: 'user' | 'project'): Install
     if (!serverConfig || typeof serverConfig !== 'object') continue;
 
     const typedConfig = serverConfig as MCPServerConfig;
-    let launchCmd: string | undefined;
-
-    if (typedConfig.type === 'http' && typedConfig.url) {
-      launchCmd = `${typedConfig.type} ${typedConfig.url}`;
-    } else if (typedConfig.command) {
-      launchCmd = `${typedConfig.command} ${(typedConfig.args || []).join(' ')}`;
-    }
+    const launchCmd = formatMcpLaunchSummary(typedConfig);
 
     const configPath = scope === 'user'
       ? '~/.codeium/windsurf/mcp_config.json'
@@ -123,7 +119,7 @@ function parseWindsurfMCPConfig(config: any, scope: 'user' | 'project'): Install
       scope,
       config_path: configPath,
       launch_command: launchCmd,
-      description: typedConfig.description,
+      description: typeof typedConfig.description === 'string' ? redactSensitiveText(typedConfig.description) : undefined,
       last_seen: new Date().toISOString(),
     });
   }

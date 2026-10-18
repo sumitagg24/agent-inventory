@@ -13,9 +13,11 @@
 
 import fs from 'fs';
 import path from 'path';
+import { readJsonFile } from './io.js';
 import os from 'os';
 
 import { InstalledItem } from './claude-code.js';
+import { formatMcpLaunchSummary, redactSensitiveText } from '../security/redaction.js';
 
 interface MCPServerConfig {
   type?: string;
@@ -55,7 +57,7 @@ export function scanVSCode(): InstalledItem[] {
   const projectMcpPath = path.join(process.cwd(), '.vscode', 'mcp.json');
   if (fs.existsSync(projectMcpPath)) {
     try {
-      const projectConfig = JSON.parse(fs.readFileSync(projectMcpPath, 'utf-8'));
+      const projectConfig = readJsonFile(projectMcpPath);
       const projectItems = parseVSCodeMCPConfig(projectConfig, 'project', projectMcpPath);
       items.push(...projectItems);
     } catch (err) {
@@ -67,7 +69,7 @@ export function scanVSCode(): InstalledItem[] {
   const userSettingsPath = getVSCodeUserSettingsPath();
   if (userSettingsPath && fs.existsSync(userSettingsPath)) {
     try {
-      const userSettings = JSON.parse(fs.readFileSync(userSettingsPath, 'utf-8'));
+      const userSettings = readJsonFile(userSettingsPath) as Record<string, any>;
       // VS Code stores MCP config under "mcp" or "mcp.servers" in settings
       const mcpConfig = userSettings.mcp || userSettings['mcp.servers'];
       if (mcpConfig) {
@@ -95,13 +97,7 @@ function parseVSCodeMCPConfig(config: any, scope: 'user' | 'project', configPath
     if (!serverConfig || typeof serverConfig !== 'object') continue;
 
     const typedConfig = serverConfig as MCPServerConfig;
-    let launchCmd: string | undefined;
-
-    if (typedConfig.type === 'http' && typedConfig.url) {
-      launchCmd = `${typedConfig.type} ${typedConfig.url}`;
-    } else if (typedConfig.command) {
-      launchCmd = `${typedConfig.command} ${(typedConfig.args || []).join(' ')}`;
-    }
+    const launchCmd = formatMcpLaunchSummary(typedConfig);
 
     items.push({
       id: `${serverName}@vscode@${scope}`,
@@ -111,7 +107,7 @@ function parseVSCodeMCPConfig(config: any, scope: 'user' | 'project', configPath
       scope,
       config_path: configPath,
       launch_command: launchCmd,
-      description: typedConfig.description,
+      description: typeof typedConfig.description === 'string' ? redactSensitiveText(typedConfig.description) : undefined,
       last_seen: new Date().toISOString(),
     });
   }
